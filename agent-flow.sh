@@ -46,7 +46,7 @@ set -euo pipefail
 # whether it was run as ./agent-flow.sh, agent-flow, or an absolute path.
 SELF_NAME="${0##*/}"
 
-TEMPLATE_VERSION="v4"
+TEMPLATE_VERSION="v5"
 TEMPLATE_MARKER="agent-flow-template: ${TEMPLATE_VERSION}"
 
 if [ -t 2 ]; then
@@ -346,6 +346,229 @@ permissions:
   - action: "*"
     resource: "*"
     effect: deny
+  # Read-only shell. An agent that cannot run `git log` or `ls` does not stop:
+  # it works around it by reading .git/HEAD, .git/config and .git/logs/HEAD as
+  # files and globbing .git/refs/*, which costs many times more calls for
+  # strictly less information, and still misses what it needed.
+  - action: "bash"
+    resource: "git *"
+    effect: allow
+  - action: "bash"
+    resource: "ls*"
+    effect: allow
+  - action: "bash"
+    resource: "find*"
+    effect: allow
+  - action: "bash"
+    resource: "cat*"
+    effect: allow
+  - action: "bash"
+    resource: "head*"
+    effect: allow
+  - action: "bash"
+    resource: "tail*"
+    effect: allow
+  - action: "bash"
+    resource: "wc*"
+    effect: allow
+  - action: "bash"
+    resource: "stat*"
+    effect: allow
+  - action: "bash"
+    resource: "file*"
+    effect: allow
+  - action: "bash"
+    resource: "du*"
+    effect: allow
+  - action: "bash"
+    resource: "tree*"
+    effect: allow
+  - action: "bash"
+    resource: "diff*"
+    effect: allow
+  - action: "bash"
+    resource: "grep*"
+    effect: allow
+  - action: "bash"
+    resource: "rg*"
+    effect: allow
+  - action: "bash"
+    resource: "fd*"
+    effect: allow
+  - action: "bash"
+    resource: "jq*"
+    effect: allow
+  - action: "bash"
+    resource: "sed*"
+    effect: allow
+  - action: "bash"
+    resource: "sort*"
+    effect: allow
+  - action: "bash"
+    resource: "uniq*"
+    effect: allow
+  - action: "bash"
+    resource: "cut*"
+    effect: allow
+  - action: "bash"
+    resource: "tr*"
+    effect: allow
+  - action: "bash"
+    resource: "pwd*"
+    effect: allow
+  - action: "bash"
+    resource: "which*"
+    effect: allow
+  - action: "bash"
+    resource: "echo*"
+    effect: allow
+  - action: "bash"
+    resource: "uname*"
+    effect: allow
+  - action: "bash"
+    resource: "uptime*"
+    effect: allow
+  - action: "bash"
+    resource: "date*"
+    effect: allow
+  - action: "bash"
+    resource: "id*"
+    effect: allow
+  - action: "bash"
+    resource: "df*"
+    effect: allow
+  - action: "bash"
+    resource: "free*"
+    effect: allow
+  - action: "bash"
+    resource: "ps*"
+    effect: allow
+  # Checks are allowed because a briefing that says "run the tests" without ever
+  # running them is a guess.
+  - action: "bash"
+    resource: "bash -n*"
+    effect: allow
+  - action: "bash"
+    resource: "shellcheck*"
+    effect: allow
+  - action: "bash"
+    resource: "make*"
+    effect: allow
+  - action: "bash"
+    resource: "cargo test*"
+    effect: allow
+  - action: "bash"
+    resource: "cargo build*"
+    effect: allow
+  - action: "bash"
+    resource: "cargo check*"
+    effect: allow
+  - action: "bash"
+    resource: "npm test*"
+    effect: allow
+  - action: "bash"
+    resource: "npm run*"
+    effect: allow
+  - action: "bash"
+    resource: "pytest*"
+    effect: allow
+  # git is readable above but never mutating: the earlier `git *` rule allowed
+  # everything, so every writing subcommand is taken back here.
+  - action: "bash"
+    resource: "git commit*"
+    effect: deny
+  - action: "bash"
+    resource: "git push*"
+    effect: deny
+  - action: "bash"
+    resource: "git reset*"
+    effect: deny
+  - action: "bash"
+    resource: "git checkout*"
+    effect: deny
+  - action: "bash"
+    resource: "git switch*"
+    effect: deny
+  - action: "bash"
+    resource: "git clean*"
+    effect: deny
+  - action: "bash"
+    resource: "git stash*"
+    effect: deny
+  - action: "bash"
+    resource: "git rebase*"
+    effect: deny
+  - action: "bash"
+    resource: "git merge*"
+    effect: deny
+  - action: "bash"
+    resource: "git revert*"
+    effect: deny
+  - action: "bash"
+    resource: "git add*"
+    effect: deny
+  # Mutations, privilege and anything reaching off the machine are denied again:
+  # this agent has no business performing them.
+  - action: "bash"
+    resource: "rm*"
+    effect: deny
+  - action: "bash"
+    resource: "mv*"
+    effect: deny
+  - action: "bash"
+    resource: "cp*"
+    effect: deny
+  - action: "bash"
+    resource: "chmod*"
+    effect: deny
+  - action: "bash"
+    resource: "chown*"
+    effect: deny
+  - action: "bash"
+    resource: "mkdir*"
+    effect: deny
+  - action: "bash"
+    resource: "touch*"
+    effect: deny
+  - action: "bash"
+    resource: "dd*"
+    effect: deny
+  - action: "bash"
+    resource: "mkfs*"
+    effect: deny
+  - action: "bash"
+    resource: "curl*"
+    effect: deny
+  - action: "bash"
+    resource: "wget*"
+    effect: deny
+  - action: "bash"
+    resource: "ssh*"
+    effect: deny
+  - action: "bash"
+    resource: "sudo*"
+    effect: deny
+  - action: "bash"
+    resource: "su*"
+    effect: deny
+  - action: "bash"
+    resource: "systemctl*"
+    effect: deny
+  - action: "bash"
+    resource: "kill*"
+    effect: deny
+  - action: "bash"
+    resource: "pkill*"
+    effect: deny
+  - action: "bash"
+    resource: "npm install*"
+    effect: deny
+  - action: "bash"
+    resource: "pip install*"
+    effect: deny
+  - action: "bash"
+    resource: "cargo install*"
+    effect: deny
   - action: "question"
     resource: "*"
     effect: deny
@@ -441,95 +664,6 @@ permissions:
   - action: "edit"
     resource: ".agent/prompts/draft.md"
     effect: allow
-  # Shell: read-only git state and directory listing only. File CONTENT must be
-  # read with the read/grep tools above, because those enforce the .env denies.
-  - action: "shell"
-    resource: "*"
-    effect: deny
-  - action: "shell"
-    resource: "pwd"
-    effect: allow
-  - action: "shell"
-    resource: "ls"
-    effect: allow
-  - action: "shell"
-    resource: "ls *"
-    effect: allow
-  - action: "shell"
-    resource: "find *"
-    effect: allow
-  - action: "shell"
-    resource: "wc *"
-    effect: allow
-  - action: "shell"
-    resource: "stat *"
-    effect: allow
-  - action: "shell"
-    resource: "file *"
-    effect: allow
-  - action: "shell"
-    resource: "git status"
-    effect: allow
-  - action: "shell"
-    resource: "git status *"
-    effect: allow
-  - action: "shell"
-    resource: "git diff"
-    effect: allow
-  - action: "shell"
-    resource: "git diff *"
-    effect: allow
-  - action: "shell"
-    resource: "git log"
-    effect: allow
-  - action: "shell"
-    resource: "git log *"
-    effect: allow
-  - action: "shell"
-    resource: "git show *"
-    effect: allow
-  - action: "shell"
-    resource: "git ls-files"
-    effect: allow
-  - action: "shell"
-    resource: "git ls-files *"
-    effect: allow
-  - action: "shell"
-    resource: "git rev-parse *"
-    effect: allow
-  - action: "shell"
-    resource: "git rev-list *"
-    effect: allow
-  - action: "shell"
-    resource: "git for-each-ref *"
-    effect: allow
-  - action: "shell"
-    resource: "git branch --show-current"
-    effect: allow
-  - action: "shell"
-    resource: "git branch --list *"
-    effect: allow
-  - action: "shell"
-    resource: "git show-branch *"
-    effect: allow
-  - action: "shell"
-    resource: "git blame *"
-    effect: allow
-  - action: "shell"
-    resource: "git grep *"
-    effect: allow
-  - action: "shell"
-    resource: "git shortlog *"
-    effect: allow
-  - action: "shell"
-    resource: "git describe *"
-    effect: allow
-  - action: "shell"
-    resource: "git count-objects *"
-    effect: allow
-  - action: "shell"
-    resource: "git config --get *"
-    effect: allow
 ---
 
 # Prompt Engineer
@@ -547,13 +681,27 @@ You do not implement anything yourself.
 ## Hard boundaries
 
 You MUST NOT modify the project in any way: no source edits, no config edits,
-no dependency changes, no patches, no "quick fixes", no running builds or tests
-that write files.
+no dependency changes, no patches, no "quick fixes", no running installers or
+anything that writes files.
 
 The only file you may write is `.agent/prompts/draft.md` — that is where your
-final prompt goes. Your shell access is limited to read-only inspection of git
-state and the directory tree. File contents must be read with your read and
+final prompt goes. Your shell is read-only: `git status`, `git log`, `git diff`,
+`git show`, `ls`, `find`, `cat`, `wc`, `grep` and friends are available, and you
+SHOULD use them rather than reconstructing git state by reading `.git/HEAD` and
+`.git/config` as text — that is slow and lossy. Writing git commands (`git
+commit`, `git push`, `git reset`, `git add`) are denied, as are `rm`, `mv`,
+`chmod`, `curl` and `sudo`. You may run non-mutating checks (`bash -n`,
+`shellcheck`, `cargo check`) when a claim in your prompt depends on them; do not
+run long test suites or installs. File contents are best read with your read and
 grep tools, which are additionally blocked for `.env` files.
+
+`.agent/` is this workflow's own bookkeeping, not part of the project. Only
+`.agent/context/PROJECT.md` is input for you; do not map the rest of the
+directory and do not go looking for files that it mentions — those belong to the
+tool, not to this repository.
+
+If a command you want is denied, do not look for a workaround: record the need
+under "Constraints" in the prompt so the Coding Agent knows.
 
 You work non-interactively. You cannot ask the user questions. When something
 is ambiguous, choose the most reasonable interpretation, state it explicitly in
@@ -836,325 +984,329 @@ permissions:
   # exfiltration and the obviously destructive commands. `git commit --amend`,
   # `git reset --hard`, `git push --force`, `git filter-branch`, `git config`
   # (hooks/aliases) and friends are all denied; the human reviews and commits.
-  - action: "shell"
+  #
+  # NOTE: these were written against `action: "shell"`, which is not an action
+  # in OpenCode V2 -- the tool is called `bash`. Every one of them was silently
+  # inert, so the Coding Agent could in fact commit, push, `sudo` and
+  # `curl | sh`, and only the prose instruction stopped it. Do not reintroduce
+  # `shell` here.
+  - action: "bash"
     resource: "*"
     effect: allow
-  - action: "shell"
+  - action: "bash"
     resource: "git commit"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git commit *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git push"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git push *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git merge"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git merge *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git rebase"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git rebase *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git cherry-pick *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git revert *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git reset"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git reset *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git clean"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git clean *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git stash"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git stash *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git checkout"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git checkout *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git switch"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git switch *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git restore"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git restore *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git reflog *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git update-ref *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git symbolic-ref *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git replace"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git replace *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git filter-branch *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git filter-repo *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git rebase --abort"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git remote"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git remote *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git config"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git config *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git rm *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git mv *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git apply *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git am *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git format-patch *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git bundle *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git gc *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git prune *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git repack *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git worktree *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git bisect"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git bisect *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git submodule *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git notes *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git send-email *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git request-pull *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git p4 *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git svn *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git mergetool *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git difftool *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git gui"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "git daemon *"
     effect: deny
-  # Privilege escalation and system configuration.
-  - action: "shell"
+  - action: "bash"
     resource: "sudo"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "sudo *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "sudoedit *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "doas *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "su *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "chmod *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "chown *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "chgrp *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "systemctl *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "launchctl *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "crontab"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "crontab *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "shutdown *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "reboot *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "poweroff *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "halt *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "killall *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "dd *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "mkfs *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "rm -rf /"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "rm -fr /"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "rm -rf /*"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "rm -fr /*"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "rm -rf ~"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "rm -rf ~/*"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "rm -rf $HOME*"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "rm -rf .git*"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "rm -rf .agent*"
     effect: deny
-  # Publishing and global installs.
-  - action: "shell"
+  - action: "bash"
     resource: "npm publish *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "yarn publish *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "pnpm publish *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "cargo publish *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "twine upload *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "npm login *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "pip install --user *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "pipx install *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "gem install *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "npm install -g *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "yarn global add *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "pnpm add -g *"
     effect: deny
-  # Piping remote code into a shell.
-  - action: "shell"
+  - action: "bash"
     resource: "curl *| sh"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "curl *| bash"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "wget *| sh"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "wget *| bash"
     effect: deny
-  # Never touch the prompt that defines this task, never drop shell history.
-  - action: "shell"
+  - action: "bash"
     resource: "* .agent/prompts/*"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "*> .agent/prompts/*"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "history -c *"
     effect: deny
-  - action: "shell"
+  - action: "bash"
     resource: "history -c"
-    effect: deny
+    effect: deny  # Publishing and global installs.
+  # Piping remote code into a shell.
+  # Never touch the prompt that defines this task, never drop shell history.
 ---
 
 # Coding Agent
@@ -1321,6 +1473,229 @@ permissions:
   - action: "*"
     resource: "*"
     effect: deny
+  # Read-only shell. An agent that cannot run `git log` or `ls` does not stop:
+  # it works around it by reading .git/HEAD, .git/config and .git/logs/HEAD as
+  # files and globbing .git/refs/*, which costs many times more calls for
+  # strictly less information, and still misses what it needed.
+  - action: "bash"
+    resource: "git *"
+    effect: allow
+  - action: "bash"
+    resource: "ls*"
+    effect: allow
+  - action: "bash"
+    resource: "find*"
+    effect: allow
+  - action: "bash"
+    resource: "cat*"
+    effect: allow
+  - action: "bash"
+    resource: "head*"
+    effect: allow
+  - action: "bash"
+    resource: "tail*"
+    effect: allow
+  - action: "bash"
+    resource: "wc*"
+    effect: allow
+  - action: "bash"
+    resource: "stat*"
+    effect: allow
+  - action: "bash"
+    resource: "file*"
+    effect: allow
+  - action: "bash"
+    resource: "du*"
+    effect: allow
+  - action: "bash"
+    resource: "tree*"
+    effect: allow
+  - action: "bash"
+    resource: "diff*"
+    effect: allow
+  - action: "bash"
+    resource: "grep*"
+    effect: allow
+  - action: "bash"
+    resource: "rg*"
+    effect: allow
+  - action: "bash"
+    resource: "fd*"
+    effect: allow
+  - action: "bash"
+    resource: "jq*"
+    effect: allow
+  - action: "bash"
+    resource: "sed*"
+    effect: allow
+  - action: "bash"
+    resource: "sort*"
+    effect: allow
+  - action: "bash"
+    resource: "uniq*"
+    effect: allow
+  - action: "bash"
+    resource: "cut*"
+    effect: allow
+  - action: "bash"
+    resource: "tr*"
+    effect: allow
+  - action: "bash"
+    resource: "pwd*"
+    effect: allow
+  - action: "bash"
+    resource: "which*"
+    effect: allow
+  - action: "bash"
+    resource: "echo*"
+    effect: allow
+  - action: "bash"
+    resource: "uname*"
+    effect: allow
+  - action: "bash"
+    resource: "uptime*"
+    effect: allow
+  - action: "bash"
+    resource: "date*"
+    effect: allow
+  - action: "bash"
+    resource: "id*"
+    effect: allow
+  - action: "bash"
+    resource: "df*"
+    effect: allow
+  - action: "bash"
+    resource: "free*"
+    effect: allow
+  - action: "bash"
+    resource: "ps*"
+    effect: allow
+  # Checks are allowed because a briefing that says "run the tests" without ever
+  # running them is a guess.
+  - action: "bash"
+    resource: "bash -n*"
+    effect: allow
+  - action: "bash"
+    resource: "shellcheck*"
+    effect: allow
+  - action: "bash"
+    resource: "make*"
+    effect: allow
+  - action: "bash"
+    resource: "cargo test*"
+    effect: allow
+  - action: "bash"
+    resource: "cargo build*"
+    effect: allow
+  - action: "bash"
+    resource: "cargo check*"
+    effect: allow
+  - action: "bash"
+    resource: "npm test*"
+    effect: allow
+  - action: "bash"
+    resource: "npm run*"
+    effect: allow
+  - action: "bash"
+    resource: "pytest*"
+    effect: allow
+  # git is readable above but never mutating: the earlier `git *` rule allowed
+  # everything, so every writing subcommand is taken back here.
+  - action: "bash"
+    resource: "git commit*"
+    effect: deny
+  - action: "bash"
+    resource: "git push*"
+    effect: deny
+  - action: "bash"
+    resource: "git reset*"
+    effect: deny
+  - action: "bash"
+    resource: "git checkout*"
+    effect: deny
+  - action: "bash"
+    resource: "git switch*"
+    effect: deny
+  - action: "bash"
+    resource: "git clean*"
+    effect: deny
+  - action: "bash"
+    resource: "git stash*"
+    effect: deny
+  - action: "bash"
+    resource: "git rebase*"
+    effect: deny
+  - action: "bash"
+    resource: "git merge*"
+    effect: deny
+  - action: "bash"
+    resource: "git revert*"
+    effect: deny
+  - action: "bash"
+    resource: "git add*"
+    effect: deny
+  # Mutations, privilege and anything reaching off the machine are denied again:
+  # this agent has no business performing them.
+  - action: "bash"
+    resource: "rm*"
+    effect: deny
+  - action: "bash"
+    resource: "mv*"
+    effect: deny
+  - action: "bash"
+    resource: "cp*"
+    effect: deny
+  - action: "bash"
+    resource: "chmod*"
+    effect: deny
+  - action: "bash"
+    resource: "chown*"
+    effect: deny
+  - action: "bash"
+    resource: "mkdir*"
+    effect: deny
+  - action: "bash"
+    resource: "touch*"
+    effect: deny
+  - action: "bash"
+    resource: "dd*"
+    effect: deny
+  - action: "bash"
+    resource: "mkfs*"
+    effect: deny
+  - action: "bash"
+    resource: "curl*"
+    effect: deny
+  - action: "bash"
+    resource: "wget*"
+    effect: deny
+  - action: "bash"
+    resource: "ssh*"
+    effect: deny
+  - action: "bash"
+    resource: "sudo*"
+    effect: deny
+  - action: "bash"
+    resource: "su*"
+    effect: deny
+  - action: "bash"
+    resource: "systemctl*"
+    effect: deny
+  - action: "bash"
+    resource: "kill*"
+    effect: deny
+  - action: "bash"
+    resource: "pkill*"
+    effect: deny
+  - action: "bash"
+    resource: "npm install*"
+    effect: deny
+  - action: "bash"
+    resource: "pip install*"
+    effect: deny
+  - action: "bash"
+    resource: "cargo install*"
+    effect: deny
   - action: "question"
     resource: "*"
     effect: deny
@@ -1415,73 +1790,6 @@ permissions:
   - action: "edit"
     resource: ".agent/context/PROJECT.draft.md"
     effect: allow
-  # Shell: read-only git state and directory listing only.
-  - action: "shell"
-    resource: "*"
-    effect: deny
-  - action: "shell"
-    resource: "pwd"
-    effect: allow
-  - action: "shell"
-    resource: "ls"
-    effect: allow
-  - action: "shell"
-    resource: "ls *"
-    effect: allow
-  - action: "shell"
-    resource: "find *"
-    effect: allow
-  - action: "shell"
-    resource: "wc *"
-    effect: allow
-  - action: "shell"
-    resource: "stat *"
-    effect: allow
-  - action: "shell"
-    resource: "file *"
-    effect: allow
-  - action: "shell"
-    resource: "git status"
-    effect: allow
-  - action: "shell"
-    resource: "git status *"
-    effect: allow
-  - action: "shell"
-    resource: "git log"
-    effect: allow
-  - action: "shell"
-    resource: "git log *"
-    effect: allow
-  - action: "shell"
-    resource: "git ls-files"
-    effect: allow
-  - action: "shell"
-    resource: "git ls-files *"
-    effect: allow
-  - action: "shell"
-    resource: "git rev-parse *"
-    effect: allow
-  - action: "shell"
-    resource: "git rev-list *"
-    effect: allow
-  - action: "shell"
-    resource: "git for-each-ref *"
-    effect: allow
-  - action: "shell"
-    resource: "git branch --show-current"
-    effect: allow
-  - action: "shell"
-    resource: "git branch --list *"
-    effect: allow
-  - action: "shell"
-    resource: "git shortlog *"
-    effect: allow
-  - action: "shell"
-    resource: "git describe *"
-    effect: allow
-  - action: "shell"
-    resource: "git config --get *"
-    effect: allow
 ---
 
 # Context Builder
@@ -1494,10 +1802,23 @@ commands, structure and conventions.
 ## Boundaries
 
 - You may write exactly one file: `.agent/context/PROJECT.draft.md`.
-- Your shell is read-only inspection of git state and the directory tree; read
-  file contents with your read and grep tools, which are additionally blocked
-  for `.env` files. Do NOT run builds, tests, installers or anything that
-  writes files. Read commands from manifests and CI instead.
+- Your shell is read-only. `git status`, `git log`, `git diff`, `ls`, `find`,
+  `cat`, `wc`, `grep` and friends are available and you SHOULD use them:
+  reconstructing git state by reading `.git/HEAD` and `.git/config` as text is
+  slow, lossy and unreliable. Writing git commands (`git commit`, `git push`,
+  `git reset`, `git add`) are denied, as are `rm`, `mv`, `chmod`, `curl` and
+  `sudo`. File contents are better read with your read and grep tools, which
+  additionally block `.env` files.
+- You may run syntax and validation checks that do not change the repository
+  (`bash -n`, `shellcheck`, `jq empty`, a config validator, `cargo check`).
+  Do NOT run installers, `npm install`, builds that rewrite lockfiles, or any
+  long test suite — validating the code is the Coding Agent's job, and your
+  briefing only needs to state the exact commands.
+- `.agent/` is this workflow's own bookkeeping, not part of the project. Do not
+  describe it, do not map it, and do not go looking for the files it mentions
+  (they belong to the tool, not to this repository).
+- If a command you want is denied, do not look for a workaround. Note it in
+  the "Pitfalls" section instead.
 - You work non-interactively; never ask questions.
 - Never read, print or copy secrets. Env example files are fine; real `.env`
   files are off limits.
@@ -1578,18 +1899,23 @@ EOF
 
 write_readme() {
     cat > "$WORKFLOW_DIR/README.md" <<'EOF'
-# Agent workflow
+# Agent workflow (bookkeeping, not your project)
+
+> This file documents the `agent-flow` tool. It says nothing about the
+> repository you happen to be in. Nothing it mentions -- the runner, its tests,
+> its scripts -- is expected to exist here. Agents must not read it as a
+> description of the project, and must not go looking for those paths.
 
 Two OpenCode agents cooperate through files in this directory.
 
-| Agent             | Access                           | Produces                      |
-|-------------------|----------------------------------|-------------------------------|
-| `prompt-engineer` | read-only (+ writes the draft)   | `.agent/prompts/latest.md`    |
-| `coding-agent`    | read/write, no commit/push       | `.agent/reports/latest.md`    |
-| `context-builder` | read-only (+ writes its draft)   | `.agent/context/PROJECT.md`   |
+| Agent             | Access                            | Produces                      |
+|-------------------|-----------------------------------|-------------------------------|
+| `prompt-engineer` | read-only shell, writes the draft | `.agent/prompts/latest.md`    |
+| `coding-agent`    | read/write, no commit/push        | `.agent/reports/latest.md`    |
+| `context-builder` | read-only shell, writes the draft | `.agent/context/PROJECT.md`   |
 
 Agent definitions live in `.opencode/agents/`. Edit them freely: the runner
-never overwrites them unless you run `./agent-flow.sh --setup --force`.
+never overwrites them unless you run the setup with `--force`.
 
 ## Layout
 
@@ -1598,8 +1924,12 @@ never overwrites them unless you run `./agent-flow.sh --setup --force`.
     .agent/reports/latest.md      current completion report
     .agent/reports/history/       archived reports
     .agent/context/PROJECT.md     project briefing every agent reads first
+    .agent/runs/                  one small record per run (what/when/branch)
     .agent/logs/                  raw agent output per run
-    .agent/runtime/               lock and temp files
+    .agent/runtime/               lock, model cache, temp files
+
+Only `PROJECT.md` is project documentation. Everything else here is the tool's
+own state.
 
 ## Git isolation
 
@@ -1612,13 +1942,14 @@ file such as `.gitignore` is modified).
 Each run happens on its own branch `agent/<task-slug>-<timestamp>` created from
 the current HEAD. If you already are on an `agent/*` branch it is reused, so
 `--continue` stays on the same branch. Use `--branch NAME` or `--no-branch` to
-override.
+override. `agent-flow --undo` removes the branch together with its uncommitted
+work, but refuses to delete commits that exist only on it.
 
 ## Project context
 
-`.agent/context/PROJECT.md` is mandatory. It is built automatically on the first
-run and can be rebuilt with `./agent-flow.sh --refresh-context` or
-`./agent-flow.sh --context-only`.
+`.agent/context/PROJECT.md` is built automatically on the first run and is
+rebuildable on demand (`--refresh-context`). It is called out as stale once it
+falls far behind HEAD or gets old.
 
 ## Rules
 
@@ -1628,31 +1959,39 @@ run and can be rebuilt with `./agent-flow.sh --refresh-context` or
   `git` output, independent of what the agent claims.
 - Concurrency: one run per repository (lock in `.agent/runtime/lock`). A stale
   lock left behind by a killed process is detected and reclaimed automatically.
-
-## Commands
-
-    ./agent-flow.sh "Task"                      full cycle
-    ./agent-flow.sh --continue "Next step"      build on the last report
-    ./agent-flow.sh --prompt-only "Task"        review the prompt before running
-    ./agent-flow.sh --implement-only            run the (possibly hand-edited) prompt
-
-## Tests
-
-`bash tests/test_agent_flow.sh` exercises the runner end to end against a
-mocked `opencode` binary; no LLM API is contacted.
+- The read-only agents get a read-only shell: `git log`, `ls`, `grep`, `make`
+  and syntax checks are available, `git commit`, `rm`, `chmod`, `curl` and
+  `sudo` are not.
 
 ## Agent permissions
 
 The generated agent files use the OpenCode V2 `permissions:` schema (ordered
-rules, last match wins). `./agent-flow.sh --verify-agents` asks opencode which
-agent definitions it actually loaded, so a stale or hand-mangled file is
-detectable.
+rules, last match wins). `agent-flow --verify-agents` asks opencode which agent
+definitions it actually loaded, and `--doctor` reports a stale or hand-mangled
+file, so the rules above are checkable rather than assumed.
 EOF
 }
 
 # ------------------------------------------------------------------------------
 # Setup
 # ------------------------------------------------------------------------------
+
+stamp_template() {
+    # The marker sits inside a quoted heredoc, where it cannot be expanded, so
+    # it used to be a literal. That meant TEMPLATE_VERSION was never reflected in
+    # the files that got installed: bumping it changed only the comparison, so
+    # every install looked outdated forever and `--setup --force` could never
+    # clear the warning.
+    local path="$1" tmp
+    [ -f "$path" ] || return 0
+    tmp="$path.stamp.$$"
+    if sed "s|agent-flow-template: v[0-9][0-9]*|${TEMPLATE_MARKER}|" "$path" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$path" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+    else
+        rm -f "$tmp" 2>/dev/null || true
+    fi
+    return 0
+}
 
 install_agent_file() {
     # install_agent_file PATH WRITER_FN LABEL
@@ -1666,6 +2005,7 @@ install_agent_file() {
     fi
 
     "$writer"
+    stamp_template "$path"
     info "Installed $label: ${path#"$ROOT"/}"
 }
 
@@ -1674,7 +2014,8 @@ install_agent_file() {
 check_agent_templates() {
     local f label missing=0
     for f in "$PROMPT_ENGINEER_FILE" "$CODING_AGENT_FILE" "$CONTEXT_BUILDER_FILE"; do
-        label="${f#"$ROOT"/}"
+        label="${f##*/}"
+        label="${label%.md}"
         [ -f "$f" ] || continue
         if grep -Eq '^permission:' "$f"; then
             error "$label uses the legacy V1 'permission:' block; OpenCode V2 ignores it. Fix with --setup --force."
@@ -1682,6 +2023,25 @@ check_agent_templates() {
         fi
         if ! grep -Eq '^permissions:' "$f"; then
             warn "$label has no 'permissions:' block: the agent runs with OpenCode defaults."
+            missing=1
+        fi
+    done
+    # The two research agents start from `action: "*" -> deny`. If nothing ever
+    # allows `bash`, they cannot run `git log` or `ls`, and they do not fail --
+    # they quietly rebuild git state by reading .git/HEAD as text, which costs
+    # many times more calls for less information. It is worth failing loudly.
+    for f in "$PROMPT_ENGINEER_FILE" "$CONTEXT_BUILDER_FILE"; do
+        [ -f "$f" ] || continue
+        label="${f##*/}"
+        if ! awk '
+            /^permissions:/ { inblock = 1; next }
+            inblock && /^---[[:space:]]*$/ { exit }
+            inblock && /action:[[:space:]]*"?bash"?/ { inbash = 1; next }
+            inblock && /action:/ { inbash = 0 }
+            inblock && inbash && /effect:[[:space:]]*"?allow"?/ { found = 1 }
+            END { exit(found ? 0 : 1) }
+        ' "$f" 2>/dev/null; then
+            error "$label allows no shell command: it cannot run git log, ls or grep, and will reconstruct repository state by reading files such as .git/HEAD. Fix with --setup --force."
             missing=1
         fi
     done
