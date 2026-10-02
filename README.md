@@ -7,10 +7,21 @@ A two-agent pipeline for [OpenCode](https://opencode.ai): Prompt Engineer → Co
 ```sh
 curl -fsSL https://raw.githubusercontent.com/mounkastel/agent-flow/main/agent-flow.sh -o ~/.local/bin/agent-flow
 chmod +x ~/.local/bin/agent-flow
+command -v agent-flow          # must print the path, not "command not found"
+```
+
+If that last line prints nothing, `~/.local/bin` is not on your `PATH` yet. Add it once:
+
+```sh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 ```
 
 Or `git clone https://github.com/mounkastel/agent-flow.git` and move `agent-flow.sh` to
 `~/.local/bin/agent-flow`. Requires `bash` (3.2+), `git` and `opencode`.
+
+`opencode` is needed too, and its background service must be able to answer a model
+listing. If `opencode models` prints nothing, start it once with `opencode service start`
+— agent-flow waits and retries for a moment, but cannot wait forever.
 
 Linux is the primary target and gets the fastest code paths. The script still runs on
 BSD/macOS userland (`find`, `sed`, `awk` and `cksum` are used through their portable
@@ -52,7 +63,13 @@ hundred models installed, and `Ctrl-D` cancels without changing anything. In a
 non-interactive context (CI, a script, a pipe) it never prompts and never blocks.
 
 The listing is cached under `.agent/runtime` for `AGENT_FLOW_MODELS_TTL` seconds
-(default 24h) because it costs a round trip to the opencode server.
+(default 24h) because it costs a round trip to the opencode server. After changing
+accounts or adding a provider, re-check the list with `AGENT_FLOW_MODELS_REFRESH=1
+agent-flow "task"`.
+
+If the listing cannot be read at all, the run is **not** blocked: agent-flow says what to
+try and continues on opencode's own default model. Picking models is a convenience, not a
+precondition.
 
 ## How it works
 

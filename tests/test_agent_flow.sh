@@ -88,6 +88,23 @@ MOCK_LOG="${MOCK_LOG:-/dev/null}"
 printf 'opencode %s\n' "$*" >> "$MOCK_LOG"
 
 if [ "${1:-}" = "models" ]; then
+    # opencode that cannot list models at all, while everything else works.
+    if [ -n "${MOCK_MODELS_FAIL:-}" ]; then
+        printf 'service unavailable\n' >&2
+        exit 1
+    fi
+    # A background opencode service that has just been (re)started answers this
+    # command with SUCCESS and an EMPTY list for a moment before it can really
+    # answer. MOCK_MODELS_EMPTY_TIMES reproduces that window; MOCK_MODELS_STATE
+    # is the counter file backing it.
+    if [ -n "${MOCK_MODELS_EMPTY_TIMES:-}" ] && [ -n "${MOCK_MODELS_STATE:-}" ]; then
+        n=$(cat "$MOCK_MODELS_STATE" 2>/dev/null || printf 0)
+        n=$((n + 1))
+        printf '%s' "$n" > "$MOCK_MODELS_STATE"
+        if [ "$n" -le "$MOCK_MODELS_EMPTY_TIMES" ]; then
+            exit 0
+        fi
+    fi
     # Candidate list, one `provider/model` per line. MOCK_MODELS overrides it.
     printf '%s\n' "${MOCK_MODELS:-opencode/alpha-1
 anthropic/claude-sonnet-4-5
@@ -365,6 +382,15 @@ assert_contains() { # LABEL HAYSTACK NEEDLE
     case "$2" in
         *"$3"*) ok "$1" ;;
         *) bad "$1" "expected to contain: $3" "actual: ${2:0:400}" ;;
+    esac
+}
+
+assert_ge() { # LABEL MINIMUM ACTUAL
+    case "$3" in
+        ''|*[!0-9]*) bad "$1" "not a number: $3" ;;
+        *)
+            if [ "$3" -ge "$2" ]; then ok "$1"; else bad "$1" "at least: $2" "actual: $3"; fi
+            ;;
     esac
 }
 
@@ -1668,6 +1694,144 @@ EOF
     rm -f /tmp/agent-flow-should-not-exist
     flow "$repo" --context-only
     assert_no_file "no expansion happens when reading the config" /tmp/agent-flow-should-not-exist
+fi
+
+if should_run "models/warm-service"; then
+    t "a model list that arrives late is waited for, not reported as an error"
+    # Reproduces the reported bug: `opencode models` is answered by a background
+    # service that, just after starting, reports SUCCESS and NO models at all.
+    # An empty answer therefore means "not ready yet", not "not authenticated".
+    repo="$(make_repo models-warm)"
+    export MOCK_CB=good
+    flow "$repo" --setup >/dev/null 2>&1
+    mkdir -p "$repo/.agent/runtime"
+    cat > "$repo/.agent/models.conf" <<'EOF'
+PE_MODEL=saved/pe
+CODER_MODEL=
+CONTEXT_MODEL=
+EOF
+    state="$SANDBOX/warm-counter"
+    printf 0 > "$state"
+    export MOCK_MODELS_STATE="$state"
+    export MOCK_MODELS_EMPTY_TIMES=3
+    export MOCK_MODELS="saved/pe
+other/model"
+    mock_log warm
+
+    AGENT_FLOW_MODELS_REFRESH=1 flow "$repo" --context-only
+    assert_eq "the run is unaffected by the cold service" 0 "$RUN_RC"
+    assert_ge "the listing was retried instead of failed" 4 "$(cat "$state")"
+    assert_eq "the remembered model is used" 0 "$RUN_RC"
+    assert_contains "and reported" "$RUN_OUT" "Prompt Engineer=saved/pe"
+
+    # The retry must also work through the picker itself.
+    printf 0 > "$state"
+    rm -f "$repo/.agent/runtime/models.list" "$repo/.agent/runtime/models.list.ts"
+    if command -v script >/dev/null 2>&1; then
+        if printf '1\n1\n1\n' | script -qec "cd '$repo' && bash '$SCRIPT' --models" /dev/null >"$SANDBOX/pty.out" 2>&1; then
+            assert_ge "the picker retried the cold service too" 4 "$(cat "$state")"
+        else
+            printf '  SKIP pty unavailable for the picker retry check\n'
+        fi
+    else
+        printf '  SKIP script(1) not installed: picker retry check\n'
+    fi
+    unset MOCK_MODELS_STATE MOCK_MODELS_EMPTY_TIMES MOCK_MODELS
+fi
+
+if should_run "models/unreachable-listing"; then
+    t "a listing that never arrives does not block the run"
+    repo="$(make_repo models-unreachable)"
+    export MOCK_CB=good
+    flow "$repo" --setup >/dev/null 2>&1
+    mkdir -p "$repo/.agent/runtime"
+    cat > "$repo/.agent/models.conf" <<'EOF'
+PE_MODEL=saved/pe
+CODER_MODEL=
+CONTEXT_MODEL=
+EOF
+    state="$SANDBOX/cold-counter"
+    printf 0 > "$state"
+    export MOCK_MODELS_STATE="$state"
+    export MOCK_MODELS_EMPTY_TIMES=99
+    mock_log cold
+
+    AGENT_FLOW_MODELS_REFRESH=1 flow "$repo" --context-only
+    assert_eq "the run still completes" 0 "$RUN_RC"
+    assert_not_contains "the model is not declared gone" "$RUN_OUT" "no longer available"
+    assert_contains "the remembered choice is kept" "$RUN_OUT" "Prompt Engineer=saved/pe"
+    assert_eq "the lookup gave up instead of looping" 4 "$(cat "$state")"
+    assert_no_file "no empty listing is left behind" \
+        "$repo/.agent/runtime/models.list"
+
+    # An opencode whose listing is unavailable, while the agents still run, must
+    # behave the same way: never fail a run over the models.
+    export MOCK_MODELS_FAIL=1
+    AGENT_FLOW_MODELS_REFRESH=1 flow "$repo" --context-only
+    assert_eq "a non-listable opencode does not fail the run" 0 "$RUN_RC"
+    assert_not_contains "and does not claim a model vanished" "$RUN_OUT" "no longer available"
+    assert_contains "the run itself still happened" "$RUN_OUT" "Review the changes"
+    unset MOCK_MODELS_STATE MOCK_MODELS_EMPTY_TIMES MOCK_MODELS_FAIL
+fi
+
+if should_run "models/advice"; then
+    t "an unavailable listing is explained in terms of the background service"
+    repo="$(make_repo models-advice)"
+    export MOCK_CB=good
+    export MOCK_MODELS_FAIL=1
+    flow "$repo" --setup >/dev/null 2>&1
+    mock_log advice
+
+    # The picker only opens on a terminal, so this needs a real one.
+    if ! command -v script >/dev/null 2>&1; then
+        printf '  SKIP script(1) not installed: picker advice check\n'
+    else
+        RUN_OUT="$(printf '' | script -qec \
+            "cd '$repo' && bash '$SCRIPT' --models" /dev/null 2>&1)"
+        RUN_RC=$?
+        assert_eq "--models reports failure" 1 "$RUN_RC"
+        assert_contains "the actual remedy is named" "$RUN_OUT" "service start"
+        assert_not_contains "no bogus claim about logging in" "$RUN_OUT" "authenticated"
+        assert_contains "the loss is made clear" "$RUN_OUT" "falls back"
+        assert_contains "and a way to pick later" "$RUN_OUT" "--models"
+        assert_no_file "nothing was saved" "$repo/.agent/models.conf"
+    fi
+    unset MOCK_MODELS_FAIL
+fi
+
+if should_run "models/offer-not-a-gate"; then
+    t "a broken model listing never costs the user the run they asked for"
+    # The exact reported failure: on the very first run in a repository the
+    # picker is offered, the listing comes back unusable, and the work still has
+    # to happen.
+    if ! command -v script >/dev/null 2>&1; then
+        printf '  SKIP script(1) not installed: first-run offer check\n'
+    else
+        repo="$(make_repo models-offer)"
+        export MOCK_CB=good MOCK_MODELS_FAIL=1
+        mock_log offer
+        RUN_OUT="$(printf 'y\n' | script -qec \
+            "cd '$repo' && bash '$SCRIPT' --context-only" /dev/null 2>&1)"
+        RUN_RC=$?
+        assert_eq "the first run completes anyway" 0 "$RUN_RC"
+        assert_contains "the problem is reported" "$RUN_OUT" "Could not read the model list"
+        assert_contains "with the real remedy" "$RUN_OUT" "service start"
+        assert_contains "and the run goes on" "$RUN_OUT" "Review the changes"
+        assert_no_file "no broken config is written" "$repo/.agent/models.conf"
+
+        # Same when the listing is merely slow rather than impossible.
+        unset MOCK_MODELS_FAIL
+        repo2="$(make_repo models-offer-slow)"
+        state="$SANDBOX/offer-counter"
+        printf 0 > "$state"
+        export MOCK_MODELS_STATE="$state" MOCK_MODELS_EMPTY_TIMES=2
+        RUN_OUT="$(printf 'y\n2\n1\n' | script -qec \
+            "cd '$repo2' && bash '$SCRIPT' --context-only" /dev/null 2>&1)"
+        RUN_RC=$?
+        assert_eq "a slow listing is simply waited out" 0 "$RUN_RC"
+        assert_ge "and it was retried" 3 "$(cat "$state")"
+        unset MOCK_MODELS_STATE MOCK_MODELS_EMPTY_TIMES
+    fi
 fi
 
 # ------------------------------------------------------------------------------

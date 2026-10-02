@@ -42,6 +42,10 @@
 
 set -euo pipefail
 
+# How this invocation should be typed back at the user, so hints stay correct
+# whether it was run as ./agent-flow.sh, agent-flow, or an absolute path.
+SELF_NAME="${0##*/}"
+
 TEMPLATE_VERSION="v4"
 TEMPLATE_MARKER="agent-flow-template: ${TEMPLATE_VERSION}"
 
@@ -98,6 +102,8 @@ Environment:
   AGENT_FLOW_CODER_MODEL    Model for Coding Agent
   AGENT_FLOW_CONTEXT_MODEL  Model for Context Builder
   AGENT_FLOW_MODELS_TTL     Seconds to reuse the cached model list (default 86400)
+  AGENT_FLOW_MODELS_REFRESH Set to 1 to re-list models and re-check the remembered
+                            choice before a run (e.g. after changing account)
   AGENT_FLOW_KEEP           History/log retention (default 100, 0 = unlimited)
   AGENT_FLOW_TIMEOUT        Per-agent-call timeout in seconds (default 0)
   AGENT_FLOW_LOCK_WAIT      Lock wait in seconds (default 0)
@@ -1772,6 +1778,10 @@ MODELS_CONF="$WORKFLOW_DIR/models.conf"
 MODELS_CACHE="$RUNTIME_DIR/models.list"
 MODELS_CACHE_TS="$RUNTIME_DIR/models.list.ts"
 MODELS_TTL="${AGENT_FLOW_MODELS_TTL:-86400}"
+# A run deliberately does not pay for a fresh listing, because the models are
+# remembered; set this after changing accounts or adding a provider.
+MODELS_FORCE_REFRESH=0
+[ "${AGENT_FLOW_MODELS_REFRESH:-0}" = "1" ] && MODELS_FORCE_REFRESH=1
 
 SAVED_PE_MODEL=""
 SAVED_CODER_MODEL=""
@@ -1841,16 +1851,32 @@ save_models_conf() {
 }
 
 refresh_models_cache() {
-    local raw
+    local raw attempt
     raw="$RUNTIME_DIR/models.raw.$$"
-    "$OPENCODE_BIN" models > "$raw" 2>/dev/null || { rm -f "$raw"; return 1; }
-    # Keep only well-formed provider/model lines and drop duplicates.
-    grep -E '^[^[:space:]/]+/[^[:space:]]+$' "$raw" 2>/dev/null \
-        | LC_ALL=C sort -u > "$MODELS_CACHE" || { rm -f "$raw"; return 1; }
-    rm -f "$raw"
-    [ -s "$MODELS_CACHE" ] || return 1
-    date '+%s' > "$MODELS_CACHE_TS" 2>/dev/null || : > "$MODELS_CACHE_TS"
-    return 0
+    # The listing is answered by opencode's background service. Just after it
+    # has been started or restarted the service accepts the request but cannot
+    # answer it yet, and the command then *succeeds while reporting no models at
+    # all*. An empty result therefore means "not ready yet", not "no models",
+    # and is retried a few times before being called a failure.
+    for attempt in 1 2 3 4; do
+        if ! "$OPENCODE_BIN" models > "$raw" 2>/dev/null; then
+            rm -f "$raw" 2>/dev/null || true
+            return 1
+        fi
+        # Keep only well-formed provider/model lines and drop duplicates.
+        grep -E '^[^[:space:]/]+/[^[:space:]]+$' "$raw" 2>/dev/null \
+            | LC_ALL=C sort -u > "$MODELS_CACHE" 2>/dev/null || true
+        if [ -s "$MODELS_CACHE" ]; then
+            rm -f "$raw" 2>/dev/null || true
+            date '+%s' > "$MODELS_CACHE_TS" 2>/dev/null || : > "$MODELS_CACHE_TS"
+            return 0
+        fi
+        [ "$attempt" -lt 4 ] && sleep 1
+    done
+    # Never leave a half-written listing behind: an empty file must not be
+    # mistaken for a cached answer on the next run.
+    rm -f "$raw" "$MODELS_CACHE" "$MODELS_CACHE_TS" 2>/dev/null || true
+    return 1
 }
 
 models_cache_fresh() {
@@ -1865,7 +1891,7 @@ models_cache_fresh() {
 }
 
 ensure_models_cache() {
-    models_cache_fresh && return 0
+    [ "$MODELS_FORCE_REFRESH" -eq 1 ] || { models_cache_fresh && return 0; }
     refresh_models_cache
 }
 
@@ -1976,12 +2002,29 @@ pick_model() { # pick_model ROLE CURRENT -> sets PICK_RESULT and PICK_EOF
     done
 }
 
+report_models_unavailable() {
+    # The message has to name the actual cause. `opencode models` is served by
+    # the background service, so the usual reason for an empty answer is that
+    # service not being up (or not up yet) -- not a missing login: an account
+    # with no linked provider still gets the models opencode offers itself.
+    printf '\n'
+    warn "Could not read the model list from '$OPENCODE_BIN models'."
+    printf '  Try, in this order:\n'
+    printf '    %s service start    start the background service\n' "$OPENCODE_BIN"
+    printf '    %s models           confirm that it prints a list\n' "$OPENCODE_BIN"
+    printf '\n'
+    printf '  Nothing is lost by skipping this: with no model chosen, opencode\n'
+    printf '  falls back to its own configured default. Pick models any time with\n'
+    printf '  %s --models, or per run with --pe-model / --coder-model.\n' "${SELF_NAME:-agent-flow.sh}"
+}
+
 configure_models() {
     if ! is_interactive; then
         die "--models needs an interactive terminal. In scripts, pass --pe-model / --coder-model instead."
     fi
     if ! ensure_models_cache; then
-        die "Cannot list models via '$OPENCODE_BIN models'. Is \`opencode\` installed and authenticated?"
+        report_models_unavailable
+        return 1
     fi
 
     pick_model "Prompt Engineer" "$SAVED_PE_MODEL"
@@ -2030,11 +2073,14 @@ maybe_offer_models() {
     case "$PROMPT_REPLY" in
         n|N|no|No) return 0 ;;
     esac
-    configure_models || {
+    if ! configure_models; then
+        # Choosing models is a convenience, not a precondition. A failed lookup
+        # must never cost the user the run they actually asked for: fall through
+        # with opencode's own default and keep going.
         printf '\n'
-        warn "Model selection cancelled; nothing was changed."
+        warn "Continuing without changing any model; the run itself is unaffected."
         return 0
-    }
+    fi
     printf '\n'
     info "Models saved to ${MODELS_CONF#"$ROOT"/}. Change them any time with --models."
 }
@@ -2044,6 +2090,11 @@ resolve_models() {
     # opencode decide. Only remembered values are validated: an explicit flag is
     # taken at face value, because the caller may know about a model the listing
     # does not mention.
+    # An explicit refresh is also a request to re-check the remembered choices
+    # below, so pull a current listing first when the caller asked for one.
+    if [ "$MODELS_FORCE_REFRESH" -eq 1 ]; then
+        ensure_models_cache || true
+    fi
     local role flagged env_value saved
     for role in PE CODER CONTEXT; do
         flagged=0
@@ -3165,9 +3216,13 @@ prune_history
 load_models_conf || true
 if [ "$CHOOSE_MODELS" -eq 1 ]; then
     if ! configure_models; then
-        printf '\n'
-        warn "Model selection cancelled; nothing was changed."
-        exit 0
+        if [ "$PICK_EOF" -eq 1 ]; then
+            printf '\n'
+            warn "Model selection cancelled; nothing was changed."
+            exit 0
+        fi
+        # The details have already been reported by report_models_unavailable.
+        exit 1
     fi
     success "Models saved to ${MODELS_CONF#"$ROOT"/}."
     printf '\n%sPrompt Engineer: %s%s\n%sCoding Agent:    %s%s\n%sContext Builder: %s%s\n' \
