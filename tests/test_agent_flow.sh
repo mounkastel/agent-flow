@@ -87,6 +87,16 @@ set -uo pipefail
 MOCK_LOG="${MOCK_LOG:-/dev/null}"
 printf 'opencode %s\n' "$*" >> "$MOCK_LOG"
 
+if [ "${1:-}" = "models" ]; then
+    # Candidate list, one `provider/model` per line. MOCK_MODELS overrides it.
+    printf '%s\n' "${MOCK_MODELS:-opencode/alpha-1
+anthropic/claude-sonnet-4-5
+anthropic/claude-opus-4-1
+openai/gpt-5.2
+openai/gpt-5.2-mini}"
+    exit 0
+fi
+
 if [ "${1:-}" = "run" ] && [ "${2:-}" = "--help" ]; then
     cat <<'EOF'
 USAGE
@@ -1551,6 +1561,113 @@ if should_run "fix/prune-collision"; then
     flow "$repo" --keep 1 --context-only
     assert_file "the collision-suffixed archive survives" "$h/20240101-000000-2.md"
     assert_no_file "the base archive is pruned" "$h/20240101-000000.md"
+fi
+
+# ==============================================================================
+# 13. Model selection
+# ==============================================================================
+
+if should_run "models/non-interactive"; then
+    t "no prompt ever appears when there is no terminal"
+    repo="$(make_repo models-noninteractive)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=completed
+
+    flow "$repo" --context-only
+    assert_eq "run succeeds" 0 "$RUN_RC"
+    assert_contains "the models in use are stated" "$RUN_OUT" "Prompt Engineer="
+    assert_not_contains "no picker is offered" "$RUN_OUT" "Pick them now"
+    assert_not_contains "no menu is drawn" "$RUN_OUT" "opencode default -- no --model flag"
+    assert_no_file "nothing is written without consent" "$repo/.agent/models.conf"
+
+    # Every other mode has to stay non-interactive too, otherwise CI would hang.
+    flow "$repo" --prompt-only "a task"
+    assert_eq "--prompt-only succeeds" 0 "$RUN_RC"
+    flow "$repo" --implement-only
+    assert_eq "--implement-only succeeds" 0 "$RUN_RC"
+    assert_not_contains "still no picker" "$RUN_OUT" "Pick them now"
+fi
+
+if should_run "models/flag-guard"; then
+    t "--models refuses to run without a terminal"
+    repo="$(make_repo models-flag)"
+    export MOCK_CB=good
+    flow "$repo" --models
+    assert_eq "--models exits 1" 1 "$RUN_RC"
+    assert_contains "the reason is explained" "$RUN_OUT" "needs an interactive terminal"
+    assert_contains "a non-interactive alternative is offered" "$RUN_OUT" "--pe-model"
+fi
+
+if should_run "models/precedence"; then
+    t "flags beat the environment, the environment beats the remembered choice"
+    repo="$(make_repo models-prec)"
+    export MOCK_CB=good
+    flow "$repo" --setup >/dev/null 2>&1
+    mkdir -p "$repo/.agent/runtime"
+    cat > "$repo/.agent/models.conf" <<'EOF'
+PE_MODEL=saved/pe
+CODER_MODEL=saved/coder
+CONTEXT_MODEL=
+EOF
+    # A fresh list that contains the saved models but not the flag value: the
+    # saved choices are validated, an explicit flag is trusted.
+    printf 'saved/pe\nsaved/coder\nonly/in-list\n' > "$repo/.agent/runtime/models.list"
+    date '+%s' > "$repo/.agent/runtime/models.list.ts"
+
+    flow "$repo" --context-only
+    assert_eq "remembered models are used" 0 "$RUN_RC"
+    assert_contains "the PE model is remembered" "$RUN_OUT" "Prompt Engineer=saved/pe"
+    assert_contains "the CA model is remembered" "$RUN_OUT" "Coding Agent=saved/coder"
+    assert_contains "the Context Builder follows the PE" "$RUN_OUT" "Context Builder=saved/pe"
+
+    flow "$repo" --context-only --pe-model flag/pe
+    assert_eq "a flag on top of the file succeeds" 0 "$RUN_RC"
+    assert_contains "the flag wins over the file" "$RUN_OUT" "Prompt Engineer=flag/pe"
+
+    AGENT_FLOW_CODER_MODEL=env/coder flow "$repo" --context-only
+    assert_contains "the environment beats the file" "$RUN_OUT" "Coding Agent=env/coder"
+fi
+
+if should_run "models/stale"; then
+    t "a remembered model that has disappeared is reported clearly"
+    repo="$(make_repo models-stale)"
+    export MOCK_CB=good
+    flow "$repo" --setup >/dev/null 2>&1
+    mkdir -p "$repo/.agent/runtime"
+    cat > "$repo/.agent/models.conf" <<'EOF'
+PE_MODEL=gone/model
+CODER_MODEL=
+CONTEXT_MODEL=
+EOF
+    printf 'other/model\n' > "$repo/.agent/runtime/models.list"
+    date '+%s' > "$repo/.agent/runtime/models.list.ts"
+
+    flow "$repo" --context-only
+    assert_eq "the run is refused" 1 "$RUN_RC"
+    assert_contains "the model is named" "$RUN_OUT" "gone/model"
+    assert_contains "a way out is offered" "$RUN_OUT" "--models"
+fi
+
+if should_run "models/corrupt-conf"; then
+    t "a hand-edited models.conf is parsed, never executed"
+    repo="$(make_repo models-corrupt)"
+    export MOCK_CB=good
+    flow "$repo" --setup >/dev/null 2>&1
+    cat > "$repo/.agent/models.conf" <<'EOF'
+# a comment
+PE_MODEL="saved/pe"
+CODER_MODEL='saved/coder'
+CONTEXT_MODEL=
+EOF
+    flow "$repo" --context-only
+    assert_eq "quotes and comments are tolerated" 0 "$RUN_RC"
+    assert_contains "quoted value is used unquoted" "$RUN_OUT" "Prompt Engineer=saved/pe"
+    assert_contains "single-quoted value too" "$RUN_OUT" "Coding Agent=saved/coder"
+
+    # A config file must never be a code-execution vector.
+    printf 'PE_MODEL=$(touch /tmp/agent-flow-should-not-exist)\n' > "$repo/.agent/models.conf"
+    rm -f /tmp/agent-flow-should-not-exist
+    flow "$repo" --context-only
+    assert_no_file "no expansion happens when reading the config" /tmp/agent-flow-should-not-exist
 fi
 
 # ------------------------------------------------------------------------------
