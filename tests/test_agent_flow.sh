@@ -2384,6 +2384,55 @@ if should_run "agents/workflow-readme"; then
     assert_contains "and the read-only shell rule" "$readme_text" "read-only shell"
 fi
 
+if should_run "agents/broken-blocks-run"; then
+    t "a run is refused when the agents cannot inspect the repository"
+    # Reported as: the run printed "allows no shell command", warned about
+    # outdated agents, and then started the agents anyway -- burning tokens on a
+    # result already known to be poor. A known-broken agent is a stop, not a
+    # warning to scroll past.
+    repo="$(make_repo agents-block)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=completed
+    flow "$repo" --setup >/dev/null 2>&1
+
+    # Replace them with definitions that predate the read-only shell, exactly as
+    # an existing checkout would still have them.
+    cat > "$repo/.opencode/agents/prompt-engineer.md" <<'EOF'
+---
+description: old
+mode: primary
+permissions:
+  - action: "*"
+    resource: "*"
+    effect: deny
+---
+body
+EOF
+    cp "$repo/.opencode/agents/prompt-engineer.md" \
+       "$repo/.opencode/agents/context-builder.md"
+
+    flow "$repo" --prompt-only "should not run"
+    assert_ne "the run is refused" 0 "$RUN_RC"
+    assert_contains "with the reason" "$RUN_OUT" "allows no shell"
+    assert_contains "and what it costs" "$RUN_OUT" ".git/HEAD"
+    assert_contains "and the exact command to run" "$RUN_OUT" "--setup --force"
+    assert_contains "and that agents are per repository" "$RUN_OUT" "checkout"
+    assert_not_contains "no agent was started" "$RUN_OUT" "Running Prompt Engineer"
+    assert_not_contains "no context was built" "$RUN_OUT" "Building project context"
+    assert_eq "no branch was created" "" "$(branch_of "$repo" | grep -c '^agent/' | tr -d ' ' | sed 's/^0$//')"
+
+    # --setup without --force must not silently keep them either.
+    flow "$repo" --setup
+    assert_ne "plain --setup is refused too" 0 "$RUN_RC"
+    assert_contains "with the same advice" "$RUN_OUT" "--setup --force"
+
+    # And --setup --force must actually clear it.
+    flow "$repo" --setup --force
+    assert_eq "--setup --force succeeds" 0 "$RUN_RC"
+    flow "$repo" --prompt-only "теперь можно"
+    assert_eq "the run proceeds" 0 "$RUN_RC"
+    assert_contains "and the Prompt Engineer actually ran" "$RUN_OUT" "Prompt generated"
+fi
+
 # ------------------------------------------------------------------------------
 # Summary
 # ------------------------------------------------------------------------------
