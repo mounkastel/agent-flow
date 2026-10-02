@@ -143,18 +143,20 @@ wins, and `bash` matches the *parsed command* (`git status --porcelain`).
 | `prompt-engineer` | same | its own `draft.md` | same |
 | `coding-agent` | everything but history rewriting and privilege | the repository | `git commit`, `git push`, `git reset`, `sudo`, `curl \| sh`, editing the prompt |
 
-"Read-only shell" here is deliberate: an agent that cannot run `git log` or `ls` does not
-fail — it rebuilds git state by reading `.git/HEAD` and `.git/config` as text, which costs
-many times more calls for strictly less information. So an agent whose permission block
-allows no shell at all is treated as a **stop**, not a warning: the run is refused before
-any agent starts, before a branch is created, with the command to fix it.
+There is deliberately **no catch-all `action: "*" → deny`** in any definition. That exact
+shape — the last matching `*/*` rule being a deny — makes opencode refuse to serve its own
+free models to that agent:
 
-```sh
-agent-flow --setup --force    # refresh the installed agent definitions
+```
+Error from provider (Console): OpenCode's free tier can only be used from within OpenCode
 ```
 
-Agent definitions are installed per repository, so a checkout created before an upgrade
-needs the same command. `--doctor` reports the same thing without refusing to run.
+The agent cannot run at all, so the strictest possible block disables the tool for exactly
+the accounts that only have free models. A deny on a single action (`action: "edit"`) or a
+single command pattern (`resource: "rm*"`) is served normally, so the protection is written
+the long way: everything wanted is allowed by name and everything dangerous is denied by
+name. `--doctor` and the pre-run check both refuse to start a run whose definitions still
+carry the catch-all, so this cannot come back unnoticed.
 
 ## Tests
 

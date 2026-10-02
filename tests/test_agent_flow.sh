@@ -422,6 +422,28 @@ assert_contains_near() { # LABEL FILE FIRST SECOND (within 3 lines)
     fi
 }
 
+agent_catchall() { # agent_catchall FILE -> effect of the last */* rule, or "none"
+    # Distinguishes an explicit deny from "no rule matched at all", which
+    # agent_rule cannot: with no catch-all rule the opencode default applies,
+    # and that is precisely what the catch-all test needs to know.
+    awk '
+        function q(s) { g = s; gsub(/^["\x27]|["\x27]$/, "", g); return g }
+        /^permissions:/ { inblock = 1; next }
+        inblock && /^---[[:space:]]*$/ { exit }
+        inblock && /action:/ {
+            cur = $0; sub(/^[^:]*:[[:space:]]*/, "", cur); ca = q(cur); next
+        }
+        inblock && /resource:/ {
+            cur = $0; sub(/^[^:]*:[[:space:]]*/, "", cur); cr = q(cur); next
+        }
+        inblock && /effect:/ {
+            cur = $0; sub(/^[^:]*:[[:space:]]*/, "", cur)
+            if (ca == "*" && cr == "*") ce = q(cur)
+        }
+        END { print (ce == "" ? "none" : ce) }
+    ' "$1" 2>/dev/null
+}
+
 agent_rule() { # agent_rule FILE ACTION RESOURCE -> allow|deny|missing
     # Last matching rule wins, wildcards are `*` and `?`, exactly as opencode
     # resolves them. Anything unmatched falls through to the base deny.
@@ -2281,15 +2303,33 @@ if should_run "agents/read-only-shell"; then
     for a in prompt-engineer context-builder; do
         f="$repo/.opencode/agents/$a.md"
         assert_file "$a exists" "$f"
-        assert_file_line "$f" '    resource: "git *"'
         assert_contains_near "$f" 'action: "bash"' 'effect: allow'
-        # Writing git commands and destructive shell commands stay denied.
-        for pat in 'git commit*' 'git push*' 'git add*' 'rm*' 'chmod*' 'curl*' 'sudo*'; do
+        # Reading and non-mutating checks are allowed, git inspection included.
+        for pat in 'git status*' 'git log*' 'git diff*' 'ls*' 'find*' 'grep*' \
+                   'cat*' 'wc*' 'npm test*' 'bash -n*'; do
             assert_file_line "$f" "    resource: \"$pat\""
+            assert_eq "$a may run: $pat" allow "$(agent_rule "$f" bash "$pat")"
+        done
+        # Writing git commands and destructive shell commands stay denied.
+        for pat in 'git commit*' 'git push*' 'git add*' 'git reset*' 'rm*' 'mv*' \
+                   'chmod*' 'chown*' 'curl*' 'wget*' 'sudo*' 'systemctl*' 'kill*'; do
+            assert_file_line "$f" "    resource: \"$pat\""
+            assert_eq "$a may not run: $pat" deny "$(agent_rule "$f" bash "$pat")"
         done
         # And the agent may still write only its own draft.
         assert_eq "$a may not edit the project" deny \
             "$(agent_rule "$f" edit README.md)"
+    done
+
+    # The whole point of the redesign: no catch-all deny anywhere. That exact
+    # shape -- and only that shape -- makes opencode refuse to serve its own free
+    # models to the agent, so it must be caught here rather than by a failed run.
+    for a in prompt-engineer context-builder coding-agent; do
+        f="$repo/.opencode/agents/$a.md"
+        case "$(agent_catchall "$f")" in
+            deny) bad "$a has no catch-all deny" "the last */* rule is a deny" ;;
+            *)    ok "$a has no catch-all deny" ;;
+        esac
     done
 
     # Exactly one file is writable per research agent.
@@ -2431,6 +2471,78 @@ EOF
     flow "$repo" --prompt-only "теперь можно"
     assert_eq "the run proceeds" 0 "$RUN_RC"
     assert_contains "and the Prompt Engineer actually ran" "$RUN_OUT" "Prompt generated"
+fi
+
+if should_run "agents/catch-all-deny"; then
+    t "a catch-all deny is caught before it breaks the free tier"
+    # opencode refuses to serve its own free models to an agent whose last
+    # matching */* rule is a deny ("OpenCode's free tier can only be used from
+    # within OpenCode"), and the agent cannot run at all. Verified against the
+    # real models, not inferred: a deny on `action: "edit"` or `resource: "rm*"`
+    # is served normally, only the catch-all shape is refused.
+    repo="$(make_repo agents-catchall)"
+    export MOCK_CB=good MOCK_PE=good
+    flow "$repo" --setup >/dev/null 2>&1
+
+    # The shipped definitions must be clean.
+    flow "$repo" --prompt-only "должен идти"
+    assert_eq "the shipped agents pass" 0 "$RUN_RC"
+
+    # Inject the shape and the run must refuse rather than start.
+    for a in prompt-engineer context-builder coding-agent; do
+        cat > "$repo/.opencode/agents/$a.md" <<'EOF'
+---
+description: catch-all deny
+mode: primary
+permissions:
+  - action: "*"
+    resource: "*"
+    effect: allow
+  - action: "bash"
+    resource: "ls*"
+    effect: allow
+  - action: "*"
+    resource: "*"
+    effect: deny
+---
+body
+EOF
+    done
+    flow "$repo" --prompt-only "не должен идти"
+    assert_ne "the run is refused" 0 "$RUN_RC"
+    assert_contains "the catch-all is named" "$RUN_OUT" "catch-all deny"
+    assert_contains "with the actual error it causes" "$RUN_OUT" "free tier"
+    assert_contains "and the remedy" "$RUN_OUT" "--setup --force"
+    assert_not_contains "no agent was started" "$RUN_OUT" "Running Prompt Engineer"
+
+    # A targeted deny is NOT the problem and must not be flagged.
+    for a in prompt-engineer context-builder coding-agent; do
+        cat > "$repo/.opencode/agents/$a.md" <<EOF
+---
+description: targeted deny only
+mode: primary
+permissions:
+  - action: "bash"
+    resource: "git status*"
+    effect: allow
+  - action: "bash"
+    resource: "rm*"
+    effect: deny
+  - action: "edit"
+    resource: "*"
+    effect: deny
+  - action: "edit"
+    resource: ".agent/context/PROJECT.draft.md"
+    effect: allow
+---
+body
+EOF
+    done
+    flow "$repo" --setup
+    assert_not_contains "a targeted deny is not accused" "$RUN_OUT" "catch-all deny"
+    flow "$repo" --setup --force >/dev/null 2>&1
+    flow "$repo" --prompt-only "снова можно"
+    assert_eq "and the run proceeds" 0 "$RUN_RC"
 fi
 
 # ------------------------------------------------------------------------------
