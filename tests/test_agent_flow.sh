@@ -88,6 +88,23 @@ MOCK_LOG="${MOCK_LOG:-/dev/null}"
 printf 'opencode %s\n' "$*" >> "$MOCK_LOG"
 
 if [ "${1:-}" = "models" ]; then
+    # opencode that cannot list models at all, while everything else works.
+    if [ -n "${MOCK_MODELS_FAIL:-}" ]; then
+        printf 'service unavailable\n' >&2
+        exit 1
+    fi
+    # A background opencode service that has just been (re)started answers this
+    # command with SUCCESS and an EMPTY list for a moment before it can really
+    # answer. MOCK_MODELS_EMPTY_TIMES reproduces that window; MOCK_MODELS_STATE
+    # is the counter file backing it.
+    if [ -n "${MOCK_MODELS_EMPTY_TIMES:-}" ] && [ -n "${MOCK_MODELS_STATE:-}" ]; then
+        n=$(cat "$MOCK_MODELS_STATE" 2>/dev/null || printf 0)
+        n=$((n + 1))
+        printf '%s' "$n" > "$MOCK_MODELS_STATE"
+        if [ "$n" -le "$MOCK_MODELS_EMPTY_TIMES" ]; then
+            exit 0
+        fi
+    fi
     # Candidate list, one `provider/model` per line. MOCK_MODELS overrides it.
     printf '%s\n' "${MOCK_MODELS:-opencode/alpha-1
 anthropic/claude-sonnet-4-5
@@ -368,6 +385,35 @@ assert_contains() { # LABEL HAYSTACK NEEDLE
     esac
 }
 
+assert_ge() { # LABEL MINIMUM ACTUAL
+    case "$3" in
+        ''|*[!0-9]*) bad "$1" "not a number: $3" ;;
+        *)
+            if [ "$3" -ge "$2" ]; then ok "$1"; else bad "$1" "at least: $2" "actual: $3"; fi
+            ;;
+    esac
+}
+
+assert_ne() { # LABEL UNEXPECTED ACTUAL
+    if [ "$2" != "$3" ]; then ok "$1"; else bad "$1" "must not equal: $2" "actual:   $2"; fi
+}
+
+assert_file_line() { # LABEL FILE KEY=VALUE
+    if grep -Fxq -- "$2" "$1" 2>/dev/null; then
+        ok "$2"
+    else
+        bad "$2" "line not found in $(basename "$1")" "actual: $(cat "$1" 2>/dev/null | tr '\n' ' ')"
+    fi
+}
+
+assert_file_contains() { # LABEL FILE NEEDLE
+    if grep -Fq -- "$2" "$1" 2>/dev/null; then
+        ok "$1"
+    else
+        bad "$1" "expected to contain: $2" "actual: $(cat "$1" 2>/dev/null | tr '\n' ' ')"
+    fi
+}
+
 assert_not_contains() { # LABEL HAYSTACK NEEDLE
     case "$2" in
         *"$3"*) bad "$1" "expected NOT to contain: $3" "actual: ${2:0:400}" ;;
@@ -444,6 +490,26 @@ count_md() { # count_md DIR -> number of *.md files (glob, no ls|grep)
         if [ -f "$f" ]; then n=$((n + 1)); fi
     done
     printf '%s' "$n"
+}
+
+count_runs() { # count_runs REPO -> number of recorded runs
+    local dir="$1/.agent/runs" n=0 f
+    if [ ! -d "$dir" ]; then
+        printf '0'
+        return 0
+    fi
+    for f in "$dir"/*.meta; do
+        if [ -f "$f" ]; then n=$((n + 1)); fi
+    done
+    printf '%s' "$n"
+}
+
+only_run_meta() { # only_run_meta REPO -> path of the single recorded run
+    local f
+    for f in "$1"/.agent/runs/*.meta; do
+        if [ -f "$f" ]; then printf '%s' "$f"; return 0; fi
+    done
+    return 0
 }
 
 # ==============================================================================
@@ -1668,6 +1734,478 @@ EOF
     rm -f /tmp/agent-flow-should-not-exist
     flow "$repo" --context-only
     assert_no_file "no expansion happens when reading the config" /tmp/agent-flow-should-not-exist
+fi
+
+if should_run "models/warm-service"; then
+    t "a model list that arrives late is waited for, not reported as an error"
+    # Reproduces the reported bug: `opencode models` is answered by a background
+    # service that, just after starting, reports SUCCESS and NO models at all.
+    # An empty answer therefore means "not ready yet", not "not authenticated".
+    repo="$(make_repo models-warm)"
+    export MOCK_CB=good
+    flow "$repo" --setup >/dev/null 2>&1
+    mkdir -p "$repo/.agent/runtime"
+    cat > "$repo/.agent/models.conf" <<'EOF'
+PE_MODEL=saved/pe
+CODER_MODEL=
+CONTEXT_MODEL=
+EOF
+    state="$SANDBOX/warm-counter"
+    printf 0 > "$state"
+    export MOCK_MODELS_STATE="$state"
+    export MOCK_MODELS_EMPTY_TIMES=3
+    export MOCK_MODELS="saved/pe
+other/model"
+    mock_log warm
+
+    AGENT_FLOW_MODELS_REFRESH=1 flow "$repo" --context-only
+    assert_eq "the run is unaffected by the cold service" 0 "$RUN_RC"
+    assert_ge "the listing was retried instead of failed" 4 "$(cat "$state")"
+    assert_eq "the remembered model is used" 0 "$RUN_RC"
+    assert_contains "and reported" "$RUN_OUT" "Prompt Engineer=saved/pe"
+
+    # The retry must also work through the picker itself.
+    printf 0 > "$state"
+    rm -f "$repo/.agent/runtime/models.list" "$repo/.agent/runtime/models.list.ts"
+    if command -v script >/dev/null 2>&1; then
+        if printf '1\n1\n1\n' | script -qec "cd '$repo' && bash '$SCRIPT' --models" /dev/null >"$SANDBOX/pty.out" 2>&1; then
+            assert_ge "the picker retried the cold service too" 4 "$(cat "$state")"
+        else
+            printf '  SKIP pty unavailable for the picker retry check\n'
+        fi
+    else
+        printf '  SKIP script(1) not installed: picker retry check\n'
+    fi
+    unset MOCK_MODELS_STATE MOCK_MODELS_EMPTY_TIMES MOCK_MODELS
+fi
+
+if should_run "models/unreachable-listing"; then
+    t "a listing that never arrives does not block the run"
+    repo="$(make_repo models-unreachable)"
+    export MOCK_CB=good
+    flow "$repo" --setup >/dev/null 2>&1
+    mkdir -p "$repo/.agent/runtime"
+    cat > "$repo/.agent/models.conf" <<'EOF'
+PE_MODEL=saved/pe
+CODER_MODEL=
+CONTEXT_MODEL=
+EOF
+    state="$SANDBOX/cold-counter"
+    printf 0 > "$state"
+    export MOCK_MODELS_STATE="$state"
+    export MOCK_MODELS_EMPTY_TIMES=99
+    mock_log cold
+
+    AGENT_FLOW_MODELS_REFRESH=1 flow "$repo" --context-only
+    assert_eq "the run still completes" 0 "$RUN_RC"
+    assert_not_contains "the model is not declared gone" "$RUN_OUT" "no longer available"
+    assert_contains "the remembered choice is kept" "$RUN_OUT" "Prompt Engineer=saved/pe"
+    assert_eq "the lookup gave up instead of looping" 4 "$(cat "$state")"
+    assert_no_file "no empty listing is left behind" \
+        "$repo/.agent/runtime/models.list"
+
+    # An opencode whose listing is unavailable, while the agents still run, must
+    # behave the same way: never fail a run over the models.
+    export MOCK_MODELS_FAIL=1
+    AGENT_FLOW_MODELS_REFRESH=1 flow "$repo" --context-only
+    assert_eq "a non-listable opencode does not fail the run" 0 "$RUN_RC"
+    assert_not_contains "and does not claim a model vanished" "$RUN_OUT" "no longer available"
+    assert_contains "the run itself still happened" "$RUN_OUT" "Review the changes"
+    unset MOCK_MODELS_STATE MOCK_MODELS_EMPTY_TIMES MOCK_MODELS_FAIL
+fi
+
+if should_run "models/advice"; then
+    t "an unavailable listing is explained in terms of the background service"
+    repo="$(make_repo models-advice)"
+    export MOCK_CB=good
+    export MOCK_MODELS_FAIL=1
+    flow "$repo" --setup >/dev/null 2>&1
+    mock_log advice
+
+    # The picker only opens on a terminal, so this needs a real one.
+    if ! command -v script >/dev/null 2>&1; then
+        printf '  SKIP script(1) not installed: picker advice check\n'
+    else
+        RUN_OUT="$(printf '' | script -qec \
+            "cd '$repo' && bash '$SCRIPT' --models" /dev/null 2>&1)"
+        RUN_RC=$?
+        assert_eq "--models reports failure" 1 "$RUN_RC"
+        assert_contains "the actual remedy is named" "$RUN_OUT" "service start"
+        assert_not_contains "no bogus claim about logging in" "$RUN_OUT" "authenticated"
+        assert_contains "the loss is made clear" "$RUN_OUT" "falls back"
+        assert_contains "and a way to pick later" "$RUN_OUT" "--models"
+        assert_no_file "nothing was saved" "$repo/.agent/models.conf"
+    fi
+    unset MOCK_MODELS_FAIL
+fi
+
+if should_run "models/offer-not-a-gate"; then
+    t "a broken model listing never costs the user the run they asked for"
+    # The exact reported failure: on the very first run in a repository the
+    # picker is offered, the listing comes back unusable, and the work still has
+    # to happen.
+    if ! command -v script >/dev/null 2>&1; then
+        printf '  SKIP script(1) not installed: first-run offer check\n'
+    else
+        repo="$(make_repo models-offer)"
+        export MOCK_CB=good MOCK_MODELS_FAIL=1
+        mock_log offer
+        RUN_OUT="$(printf 'y\n' | script -qec \
+            "cd '$repo' && bash '$SCRIPT' --context-only" /dev/null 2>&1)"
+        RUN_RC=$?
+        assert_eq "the first run completes anyway" 0 "$RUN_RC"
+        assert_contains "the problem is reported" "$RUN_OUT" "Could not read the model list"
+        assert_contains "with the real remedy" "$RUN_OUT" "service start"
+        assert_contains "and the run goes on" "$RUN_OUT" "Review the changes"
+        assert_no_file "no broken config is written" "$repo/.agent/models.conf"
+
+        # Same when the listing is merely slow rather than impossible.
+        unset MOCK_MODELS_FAIL
+        repo2="$(make_repo models-offer-slow)"
+        state="$SANDBOX/offer-counter"
+        printf 0 > "$state"
+        export MOCK_MODELS_STATE="$state" MOCK_MODELS_EMPTY_TIMES=2
+        RUN_OUT="$(printf 'y\n2\n1\n' | script -qec \
+            "cd '$repo2' && bash '$SCRIPT' --context-only" /dev/null 2>&1)"
+        RUN_RC=$?
+        assert_eq "a slow listing is simply waited out" 0 "$RUN_RC"
+        assert_ge "and it was retried" 3 "$(cat "$state")"
+        unset MOCK_MODELS_STATE MOCK_MODELS_EMPTY_TIMES
+    fi
+fi
+
+# ==============================================================================
+# 14. Inspecting and undoing runs
+# ==============================================================================
+
+seed_run() { # seed_run REPO TASK -> path of the recorded run
+    flow "$1" --prompt-only "$2" >/dev/null 2>&1
+    printf '%s' "$1"
+}
+
+if should_run "ux/record"; then
+    t "every run leaves a record that says what it did"
+    repo="$(make_repo ux-record)"
+    export MOCK_CB=good MOCK_PE=good
+    flow "$repo" --prompt-only "первая задача"
+    assert_eq "the run succeeds" 0 "$RUN_RC"
+    assert_file "a record was written" "$repo/.agent/runs/"*.meta
+    n="$(count_runs "$repo")"
+    assert_eq "one record per run" 1 "$n"
+    meta="$(only_run_meta "$repo")"
+    assert_file_line "$meta" "mode=prompt-only"
+    assert_file_line "$meta" "result=done"
+    assert_file_line "$meta" "rc=0"
+    assert_file "the task text is kept verbatim" "$repo/.agent/runs/"*.task
+    assert_file_contains "$repo"/.agent/runs/*.task "первая задача"
+fi
+
+if should_run "ux/record-collision"; then
+    t "two runs in the same second do not overwrite each other"
+    repo="$(make_repo ux-collide)"
+    export MOCK_CB=good MOCK_PE=good
+    flow "$repo" --prompt-only "раз"
+    flow "$repo" --prompt-only "два"
+    flow "$repo" --prompt-only "три"
+    n="$(count_runs "$repo")"
+    assert_ge "every run kept its own record" 3 "$n"
+    flow "$repo" --history
+    assert_contains "all three are listed" "$RUN_OUT" "раз"
+    assert_contains "and counted" "$RUN_OUT" "два"
+    assert_contains "and counted again" "$RUN_OUT" "три"
+fi
+
+if should_run "ux/status"; then
+    t "--status reports the state of the repository without changing it"
+    repo="$(make_repo ux-status)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=completed
+    flow "$repo" --prompt-only "задача для статуса"
+    before="$(git -C "$repo" status --porcelain | wc -l | tr -d ' ')"
+
+    flow "$repo" --status
+    assert_eq "--status succeeds" 0 "$RUN_RC"
+    assert_contains "the last run is named" "$RUN_OUT" "Last run:"
+    assert_contains "with its outcome" "$RUN_OUT" "done"
+    assert_contains "the branch is shown" "$RUN_OUT" "Branch:"
+    assert_contains "the task is shown" "$RUN_OUT" "задача для статуса"
+    assert_contains "the models in use are shown" "$RUN_OUT" "Models:"
+    assert_contains "the context age is shown" "$RUN_OUT" "Context:"
+    assert_contains "the lock state is shown" "$RUN_OUT" "Lock:"
+    assert_eq "uncommitted paths are counted" 0 "$(printf '%s' "$RUN_OUT" | grep -oE 'Uncommitted: +[0-9]+' | grep -oE '[0-9]+' | head -1)"
+    after="$(git -C "$repo" status --porcelain | wc -l | tr -d ' ')"
+    assert_eq "nothing was changed" "$before" "$after"
+    assert_no_file "no lock was taken" "$repo/.agent/runtime/lock/lock"
+fi
+
+if should_run "ux/status-empty"; then
+    t "--status works in a repository that has never been run in"
+    repo="$(make_repo ux-status-empty)"
+    flow "$repo" --setup >/dev/null 2>&1
+    rm -rf "$repo/.agent/runs"
+    flow "$repo" --status
+    assert_eq "it does not fail" 0 "$RUN_RC"
+    assert_contains "it says so" "$RUN_OUT" "none recorded yet"
+    assert_contains "and the context is reported as missing" "$RUN_OUT" "not built yet"
+fi
+
+if should_run "ux/doctor"; then
+    t "--doctor checks the environment and reaches a verdict"
+    repo="$(make_repo ux-doctor)"
+    export MOCK_CB=good
+    flow "$repo" --setup >/dev/null 2>&1
+    flow "$repo" --doctor
+    assert_eq "--doctor succeeds in a healthy repository" 0 "$RUN_RC"
+    assert_contains "bash is checked" "$RUN_OUT" "bash"
+    assert_contains "git is checked" "$RUN_OUT" "git"
+    assert_contains "opencode is checked" "$RUN_OUT" "opencode"
+    assert_contains "the agents are checked" "$RUN_OUT" "agent Prompt Engineer"
+    assert_contains "the verdict is stated" "$RUN_OUT" "verdict"
+    assert_contains "and it is a ready one" "$RUN_OUT" "ready to run"
+
+    # A broken environment must be reported as such.
+    printf '#!/bin/sh\nexit 1\n' > "$SANDBOX/oc-broken"
+    chmod +x "$SANDBOX/oc-broken"
+    AGENT_FLOW_OPENCODE_BIN="$SANDBOX/oc-broken" flow "$repo" --doctor
+    assert_eq "a broken opencode makes it fail" 1 "$RUN_RC"
+    assert_contains "the failure is reported" "$RUN_OUT" "fail"
+    assert_contains "and the verdict is not ready" "$RUN_OUT" "not ready"
+fi
+
+if should_run "ux/doctor-missing-agents"; then
+    t "--doctor notices missing and outdated agent definitions"
+    repo="$(make_repo ux-doctor-agents)"
+    export MOCK_CB=good
+    flow "$repo" --setup >/dev/null 2>&1
+    rm -f "$repo/.opencode/agents/coding-agent.md"
+    printf 'stale content without the template marker\n' > "$repo/.opencode/agents/prompt-engineer.md"
+    flow "$repo" --doctor
+    assert_contains "a missing agent is a failure" "$RUN_OUT" "missing"
+    assert_contains "with the fix" "$RUN_OUT" "--setup"
+    assert_contains "an outdated agent is a warning" "$RUN_OUT" "outdated"
+fi
+
+if should_run "ux/history"; then
+    t "--history lists past runs newest first"
+    repo="$(make_repo ux-history)"
+    export MOCK_CB=good MOCK_PE=good
+    flow "$repo" --prompt-only "старая"
+    flow "$repo" --prompt-only "новая"
+    flow "$repo" --history
+    assert_eq "--history succeeds" 0 "$RUN_RC"
+    assert_contains "both runs are listed" "$RUN_OUT" "старая"
+    assert_contains "including the newer" "$RUN_OUT" "новая"
+    assert_contains "the header explains the order" "$RUN_OUT" "newest first"
+    assert_contains "and how to inspect one" "$RUN_OUT" "--show"
+
+    flow "$repo" --history >/dev/null 2>&1
+    rm -rf "$repo/.agent/runs"
+    flow "$repo" --history
+    assert_eq "an empty history is not an error" 0 "$RUN_RC"
+    assert_contains "it says there is nothing" "$RUN_OUT" "No runs recorded yet"
+fi
+
+if should_run "ux/show"; then
+    t "--show prints the task, the prompt and the report of a chosen run"
+    repo="$(make_repo ux-show)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=completed
+    flow "$repo" --prompt-only "первая"
+    flow "$repo" "вторая"
+
+    flow "$repo" --show
+    assert_eq "--show defaults to the newest run" 0 "$RUN_RC"
+    assert_contains "the task is shown" "$RUN_OUT" "вторая"
+
+    flow "$repo" --show 2
+    assert_eq "--show N works" 0 "$RUN_RC"
+    assert_contains "the older task is shown" "$RUN_OUT" "первая"
+    assert_contains "its mode too" "$RUN_OUT" "prompt-only"
+
+    flow "$repo" --show 99
+    assert_eq "a run that does not exist is an error" 1 "$RUN_RC"
+    assert_contains "with a pointer to history" "$RUN_OUT" "--history"
+fi
+
+if should_run "ux/undo-refuses"; then
+    t "--undo refuses to delete commits"
+    repo="$(make_repo ux-undo-commits)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=completed
+    flow "$repo" "задача с коммитом"
+    branch="$(branch_of "$repo")"
+    printf 'work\n' > "$repo/committed.txt"
+    git -C "$repo" add committed.txt
+    git -C "$repo" commit -qm "agent commit"
+
+    flow "$repo" --undo --yes
+    assert_eq "--undo refuses" 1 "$RUN_RC"
+    assert_contains "and says why" "$RUN_OUT" "not on"
+    assert_contains "with the commit count" "$RUN_OUT" "commit(s) that are not on"
+    assert_contains "a way to keep them" "$RUN_OUT" "cherry-pick"
+    assert_contains "and a way to drop them" "$RUN_OUT" "branch -D"
+    assert_eq "the branch survives" "$branch" "$(branch_of "$repo")"
+
+    # --yes must not become a way around the one thing that is never allowed.
+    flow "$repo" --undo --yes
+    assert_eq "--yes does not override it" 1 "$RUN_RC"
+    assert_eq "and the commit is still there" 1 \
+        "$(git -C "$repo" rev-list --count "master..$branch")"
+fi
+
+if should_run "ux/undo-non-agent"; then
+    t "--undo refuses to touch a branch it did not create"
+    repo="$(make_repo ux-undo-nonagent)"
+    export MOCK_CB=good
+    flow "$repo" --setup >/dev/null 2>&1
+    flow "$repo" --undo
+    assert_eq "it refuses" 1 "$RUN_RC"
+    assert_contains "and explains the rule" "$RUN_OUT" "agent/*"
+    assert_eq "the branch is untouched" "master" "$(branch_of "$repo")"
+fi
+
+if should_run "ux/undo-cleans"; then
+    t "--undo removes tracked edits, new files and the branch"
+    if ! command -v script >/dev/null 2>&1; then
+        printf '  SKIP script(1) not installed: undo confirmation check\n'
+    else
+        repo="$(make_repo ux-undo-clean)"
+        export MOCK_CB=good MOCK_PE=good MOCK_CA=completed
+        flow "$repo" "задача для отката"
+        branch="$(branch_of "$repo")"
+        printf 'edited\n' >> "$repo/README.md"
+        printf 'new\n' > "$repo/created.txt"
+        mkdir -p "$repo/deep/dir"
+        printf 'nested\n' > "$repo/deep/dir/file.txt"
+
+        # A wrong answer must change nothing at all.
+        RUN_OUT="$(printf 'no\n' | script -qec \
+            "cd '$repo' && bash '$SCRIPT' --undo" /dev/null 2>&1)"
+        RUN_RC=$?
+        assert_ne "a wrong answer is refused" 0 "$RUN_RC"
+        assert_contains "and says so" "$RUN_OUT" "Nothing was changed"
+        assert_eq "still on the agent branch" "$branch" "$(branch_of "$repo")"
+        assert_file "the new file is still there" "$repo/created.txt"
+
+        RUN_OUT="$(printf 'undo\n' | script -qec \
+            "cd '$repo' && bash '$SCRIPT' --undo" /dev/null 2>&1)"
+        RUN_RC=$?
+        assert_eq "the confirmed undo succeeds" 0 "$RUN_RC"
+        assert_contains "it names the branch" "$RUN_OUT" "$branch"
+        assert_eq "back on the base branch" "master" "$(branch_of "$repo")"
+        assert_no_file "the new file is gone" "$repo/created.txt"
+        assert_no_file "the nested new file is gone" "$repo/deep/dir/file.txt"
+        assert_eq "nothing is left uncommitted" 0 \
+            "$(git -C "$repo" status --porcelain | grep -v '^$' | wc -l | tr -d ' ')"
+        assert_dir "the workflow bookkeeping is kept" "$repo/.agent"
+    fi
+fi
+
+if should_run "ux/undo-clean-tree"; then
+    t "--undo on a clean agent branch needs no confirmation"
+    repo="$(make_repo ux-undo-clean-tree)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=completed
+    flow "$repo" "чистая задача"
+    branch="$(branch_of "$repo")"
+    flow "$repo" --undo < /dev/null
+    assert_eq "it succeeds without asking anything" 0 "$RUN_RC"
+    assert_contains "and says nothing can be lost" "$RUN_OUT" "nothing can be lost"
+    assert_eq "back on the base branch" "master" "$(branch_of "$repo")"
+    assert_eq "the agent branch is gone" "" "$(git -C "$repo" branch --list "$branch" | tr -d ' *')"
+    assert_dir "and the workflow files are kept" "$repo/.agent"
+fi
+
+if should_run "ux/readonly-no-lock"; then
+    t "the read-only commands do not take the lock"
+    repo="$(make_repo ux-readonly-lock)"
+    export MOCK_CB=good MOCK_PE=good
+    flow "$repo" --setup >/dev/null 2>&1
+    mkdir -p "$repo/.agent/runtime/lock"
+    printf '%s\n' "$$" > "$repo/.agent/runtime/lock/pid"
+
+    for mode in --status --doctor --history; do
+        flow "$repo" "$mode"
+        assert_eq "$mode is not blocked by a held lock" 0 "$RUN_RC"
+    done
+    assert_file "the lock is still there" "$repo/.agent/runtime/lock/pid"
+fi
+
+if should_run "ux/context-stale"; then
+    t "a context that is too old is called out, one that is fresh is not"
+    repo="$(make_repo ux-context-stale)"
+    export MOCK_CB=good MOCK_PE=good
+    flow "$repo" --context-only
+    assert_eq "the context is built" 0 "$RUN_RC"
+
+    flow "$repo" --prompt-only "свежая задача"
+    assert_not_contains "a fresh context is not called stale" "$RUN_OUT" "stale"
+
+    # Backdate the record by 200 days.
+    gen="$(date -d '200 days ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+        || date -v-200d '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '')"
+    if [ -z "$gen" ]; then
+        printf '  SKIP no date -d/-v available to backdate the record\n'
+    else
+        sed -i.bak "s/^generated=.*/generated=$gen/" "$repo/.agent/context/meta"
+        rm -f "$repo/.agent/context/meta.bak"
+        flow "$repo" --prompt-only "старая задача"
+        assert_contains "an old context is called stale" "$RUN_OUT" "stale"
+        assert_contains "with its age" "$RUN_OUT" "days old"
+        assert_contains "and the way out" "$RUN_OUT" "--refresh-context"
+
+        # The threshold is configurable.
+        flow "$repo" --prompt-only "ещё раз"
+        AGENT_FLOW_CONTEXT_MAX_DAYS=9999 flow "$repo" --prompt-only "и ещё"
+        assert_not_contains "a raised threshold silences it" "$RUN_OUT" "stale"
+    fi
+fi
+
+if should_run "ux/timeout-default"; then
+    t "agent calls are capped by default and the cap can be lifted"
+    repo="$(make_repo ux-timeout)"
+    export MOCK_CB=good
+    flow "$repo" --setup >/dev/null 2>&1
+    flow "$repo" --help
+    assert_contains "the default is documented" "$RUN_OUT" "default 3600"
+    assert_contains "and how to disable it" "$RUN_OUT" "0 = no limit"
+    flow "$repo" --help
+    assert_contains "the environment override is documented" "$RUN_OUT" "AGENT_FLOW_TIMEOUT"
+
+    # And it is actually applied.
+    mock_log timeout
+    MOCK_SLEEP=0 flow "$repo" --context-only
+    flow "$repo" --context-only
+    assert_contains "a run still works" "$RUN_OUT" "Review the changes"
+fi
+
+if should_run "ux/timeout-no-orphan"; then
+    t "the timeout watchdog leaves nothing holding the script's stdout"
+    # Regression: with a non-zero default timeout a watchdog is started for every
+    # agent call. Killing that watchdog used to orphan its `sleep`, which had
+    # inherited stdout -- so any command substitution around this script (or a
+    # pipe) blocked for the whole timeout after the run was already finished.
+    repo="$(make_repo ux-timeout-orphan)"
+    export MOCK_CB=good MOCK_PE=good
+    flow "$repo" --setup >/dev/null 2>&1
+
+    before="n/a"
+    if command -v pgrep >/dev/null 2>&1; then
+        before="$(pgrep -c -f 'sleep 3600' 2>/dev/null || echo 0)"
+    fi
+
+    start=$SECONDS
+    RUN_OUT="$(cd "$repo" && bash "$SCRIPT" --prompt-only "быстрый запуск" 2>&1)"
+    RUN_RC=$?
+    took=$((SECONDS - start))
+
+    assert_eq "the run succeeds" 0 "$RUN_RC"
+    assert_contains "and really did the work" "$RUN_OUT" "Prompt generated"
+    if [ "$took" -lt 60 ]; then
+        ok "the pipe closed with the run, not after the timeout (${took}s)"
+    else
+        bad "the pipe closed with the run" "took ${took}s -- the timeout watchdog leaked"
+    fi
+    if [ "$before" != "n/a" ]; then
+        assert_eq "no watchdog process is left behind" "$before" \
+            "$(pgrep -c -f 'sleep 3600' 2>/dev/null || echo 0)"
+    fi
 fi
 
 # ------------------------------------------------------------------------------

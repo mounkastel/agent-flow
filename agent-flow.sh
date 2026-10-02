@@ -42,6 +42,10 @@
 
 set -euo pipefail
 
+# How this invocation should be typed back at the user, so hints stay correct
+# whether it was run as ./agent-flow.sh, agent-flow, or an absolute path.
+SELF_NAME="${0##*/}"
+
 TEMPLATE_VERSION="v4"
 TEMPLATE_MARKER="agent-flow-template: ${TEMPLATE_VERSION}"
 
@@ -76,6 +80,11 @@ Usage:
   agent-flow.sh --verify-agents                Check that opencode loads our agent definitions
   agent-flow.sh --task-file FILE               Read the task from a file
   agent-flow.sh --models                       Pick the models interactively, then exit
+  agent-flow.sh --status                       What happened last, and where things stand
+  agent-flow.sh --doctor                       Check the environment, report what is broken
+  agent-flow.sh --history                      List past runs, newest first
+  agent-flow.sh --show [N]                     Show run N (default 1 = the newest)
+  agent-flow.sh --undo                         Remove the agent branch and its uncommitted work
   echo "task" | agent-flow.sh                  Read the task from stdin
 
 Options:
@@ -83,13 +92,15 @@ Options:
   --no-branch            Do not create a branch; work on the current one
   --refresh-context      Rebuild .agent/context/PROJECT.md before running
   --keep N               Keep the newest N history/log files (0 = keep all)
-  --timeout SEC          Hard limit per agent call (0 = no limit, default 0)
+  --timeout SEC          Hard limit per agent call (default 3600, 0 = no limit)
   --lock-wait SEC        Wait up to SEC for a concurrent run to release its lock
   --no-auto              Do not pass --auto to `opencode run` (stricter, may stall)
   --pe-model MODEL       Model for Prompt Engineer (provider/model)
   --coder-model MODEL    Model for Coding Agent    (provider/model)
   --context-model MODEL  Model for Context Builder (defaults to the PE model)
   --models               Interactively pick the models and save them for this repo
+  --undo                 Return to the base branch and delete the agent branch
+  --yes, -y              With --undo: skip the confirmation before discarding work
   --force                With --setup: overwrite existing agent definitions
   -h, --help             Show this help
 
@@ -98,6 +109,11 @@ Environment:
   AGENT_FLOW_CODER_MODEL    Model for Coding Agent
   AGENT_FLOW_CONTEXT_MODEL  Model for Context Builder
   AGENT_FLOW_MODELS_TTL     Seconds to reuse the cached model list (default 86400)
+  AGENT_FLOW_MODELS_REFRESH Set to 1 to re-list models and re-check the remembered
+                            choice before a run (e.g. after changing account)
+  AGENT_FLOW_CONTEXT_MAX_DAYS  Days after which the project context counts as
+                            stale and is called out (default 30)
+  AGENT_FLOW_TIMEOUT     Override the per-agent-call timeout (0 = no limit)
   AGENT_FLOW_KEEP           History/log retention (default 100, 0 = unlimited)
   AGENT_FLOW_TIMEOUT        Per-agent-call timeout in seconds (default 0)
   AGENT_FLOW_LOCK_WAIT      Lock wait in seconds (default 0)
@@ -111,7 +127,10 @@ Exit codes:
   3 no usable completion report
 
 Always-on behavior:
-  * Project context (.agent/context/PROJECT.md) is built on first run.
+  * Project context (.agent/context/PROJECT.md) is built on first run, and is
+    called out as stale once it falls too far behind HEAD or gets too old.
+  * Each agent call is capped at --timeout seconds (default 3600) so a wedged
+    agent cannot hang the run forever.
   * On the first run in a repository you are offered a one-time model picker;
     the choice is remembered in .agent/models.conf and every later run just
     prints which models it is using. Re-pick any time with --models.
@@ -143,7 +162,7 @@ MERGE_HINT=""
 TASK=""
 TASK_FILE=""
 KEEP="${AGENT_FLOW_KEEP:-100}"
-TIMEOUT="${AGENT_FLOW_TIMEOUT:-0}"
+TIMEOUT="${AGENT_FLOW_TIMEOUT:-3600}"
 LOCK_WAIT="${AGENT_FLOW_LOCK_WAIT:-0}"
 VERIFY_RETRY_WAIT="${AGENT_FLOW_VERIFY_WAIT:-2}"
 AUTO="1"
@@ -157,6 +176,8 @@ PE_MODEL_FLAGGED=0
 CODER_MODEL_FLAGGED=0
 CONTEXT_MODEL_FLAGGED=0
 CHOOSE_MODELS=0
+SHOW_RUN="1"
+ASSUME_YES=0
 OPENCODE_BIN="${AGENT_FLOW_OPENCODE_BIN:-opencode}"
 OPENCODE_EXTRA_ARGS="${AGENT_FLOW_OPENCODE_ARGS:-}"
 OPENCODE_HAS_AUTO=""
@@ -201,6 +222,17 @@ while [ $# -gt 0 ]; do
             need_value "$1" "$#"
             CONTEXT_MODEL="$2"; CONTEXT_MODEL_FLAGGED=1; shift ;;
         --models|--choose-models) CHOOSE_MODELS=1 ;;
+        --status)          MODE="status" ;;
+        --doctor)          MODE="doctor" ;;
+        --history)         MODE="history" ;;
+        --show)
+            MODE="show"
+            case "${2:-}" in
+                ''|-*) SHOW_RUN=1 ;;
+                *)     SHOW_RUN="$2"; shift ;;
+            esac ;;
+        --undo)            MODE="undo" ;;
+        --yes|-y)          ASSUME_YES=1 ;;
         --)
             shift
             TASK="${TASK:+$TASK }$*"
@@ -1772,6 +1804,10 @@ MODELS_CONF="$WORKFLOW_DIR/models.conf"
 MODELS_CACHE="$RUNTIME_DIR/models.list"
 MODELS_CACHE_TS="$RUNTIME_DIR/models.list.ts"
 MODELS_TTL="${AGENT_FLOW_MODELS_TTL:-86400}"
+# A run deliberately does not pay for a fresh listing, because the models are
+# remembered; set this after changing accounts or adding a provider.
+MODELS_FORCE_REFRESH=0
+[ "${AGENT_FLOW_MODELS_REFRESH:-0}" = "1" ] && MODELS_FORCE_REFRESH=1
 
 SAVED_PE_MODEL=""
 SAVED_CODER_MODEL=""
@@ -1841,16 +1877,32 @@ save_models_conf() {
 }
 
 refresh_models_cache() {
-    local raw
+    local raw attempt
     raw="$RUNTIME_DIR/models.raw.$$"
-    "$OPENCODE_BIN" models > "$raw" 2>/dev/null || { rm -f "$raw"; return 1; }
-    # Keep only well-formed provider/model lines and drop duplicates.
-    grep -E '^[^[:space:]/]+/[^[:space:]]+$' "$raw" 2>/dev/null \
-        | LC_ALL=C sort -u > "$MODELS_CACHE" || { rm -f "$raw"; return 1; }
-    rm -f "$raw"
-    [ -s "$MODELS_CACHE" ] || return 1
-    date '+%s' > "$MODELS_CACHE_TS" 2>/dev/null || : > "$MODELS_CACHE_TS"
-    return 0
+    # The listing is answered by opencode's background service. Just after it
+    # has been started or restarted the service accepts the request but cannot
+    # answer it yet, and the command then *succeeds while reporting no models at
+    # all*. An empty result therefore means "not ready yet", not "no models",
+    # and is retried a few times before being called a failure.
+    for attempt in 1 2 3 4; do
+        if ! "$OPENCODE_BIN" models > "$raw" 2>/dev/null; then
+            rm -f "$raw" 2>/dev/null || true
+            return 1
+        fi
+        # Keep only well-formed provider/model lines and drop duplicates.
+        grep -E '^[^[:space:]/]+/[^[:space:]]+$' "$raw" 2>/dev/null \
+            | LC_ALL=C sort -u > "$MODELS_CACHE" 2>/dev/null || true
+        if [ -s "$MODELS_CACHE" ]; then
+            rm -f "$raw" 2>/dev/null || true
+            date '+%s' > "$MODELS_CACHE_TS" 2>/dev/null || : > "$MODELS_CACHE_TS"
+            return 0
+        fi
+        [ "$attempt" -lt 4 ] && sleep 1
+    done
+    # Never leave a half-written listing behind: an empty file must not be
+    # mistaken for a cached answer on the next run.
+    rm -f "$raw" "$MODELS_CACHE" "$MODELS_CACHE_TS" 2>/dev/null || true
+    return 1
 }
 
 models_cache_fresh() {
@@ -1865,7 +1917,7 @@ models_cache_fresh() {
 }
 
 ensure_models_cache() {
-    models_cache_fresh && return 0
+    [ "$MODELS_FORCE_REFRESH" -eq 1 ] || { models_cache_fresh && return 0; }
     refresh_models_cache
 }
 
@@ -1976,12 +2028,29 @@ pick_model() { # pick_model ROLE CURRENT -> sets PICK_RESULT and PICK_EOF
     done
 }
 
+report_models_unavailable() {
+    # The message has to name the actual cause. `opencode models` is served by
+    # the background service, so the usual reason for an empty answer is that
+    # service not being up (or not up yet) -- not a missing login: an account
+    # with no linked provider still gets the models opencode offers itself.
+    printf '\n'
+    warn "Could not read the model list from '$OPENCODE_BIN models'."
+    printf '  Try, in this order:\n'
+    printf '    %s service start    start the background service\n' "$OPENCODE_BIN"
+    printf '    %s models           confirm that it prints a list\n' "$OPENCODE_BIN"
+    printf '\n'
+    printf '  Nothing is lost by skipping this: with no model chosen, opencode\n'
+    printf '  falls back to its own configured default. Pick models any time with\n'
+    printf '  %s --models, or per run with --pe-model / --coder-model.\n' "${SELF_NAME:-agent-flow.sh}"
+}
+
 configure_models() {
     if ! is_interactive; then
         die "--models needs an interactive terminal. In scripts, pass --pe-model / --coder-model instead."
     fi
     if ! ensure_models_cache; then
-        die "Cannot list models via '$OPENCODE_BIN models'. Is \`opencode\` installed and authenticated?"
+        report_models_unavailable
+        return 1
     fi
 
     pick_model "Prompt Engineer" "$SAVED_PE_MODEL"
@@ -2030,11 +2099,14 @@ maybe_offer_models() {
     case "$PROMPT_REPLY" in
         n|N|no|No) return 0 ;;
     esac
-    configure_models || {
+    if ! configure_models; then
+        # Choosing models is a convenience, not a precondition. A failed lookup
+        # must never cost the user the run they actually asked for: fall through
+        # with opencode's own default and keep going.
         printf '\n'
-        warn "Model selection cancelled; nothing was changed."
+        warn "Continuing without changing any model; the run itself is unaffected."
         return 0
-    }
+    fi
     printf '\n'
     info "Models saved to ${MODELS_CONF#"$ROOT"/}. Change them any time with --models."
 }
@@ -2044,6 +2116,11 @@ resolve_models() {
     # opencode decide. Only remembered values are validated: an explicit flag is
     # taken at face value, because the caller may know about a model the listing
     # does not mention.
+    # An explicit refresh is also a request to re-check the remembered choices
+    # below, so pull a current listing first when the caller asked for one.
+    if [ "$MODELS_FORCE_REFRESH" -eq 1 ]; then
+        ensure_models_cache || true
+    fi
     local role flagged env_value saved
     for role in PE CODER CONTEXT; do
         flagged=0
@@ -2089,10 +2166,537 @@ print_models_line() {
     info "Change with --models, or per-run with --pe-model / --coder-model / --context-model."
 }
 
-setup_workflow() {
+# ------------------------------------------------------------------------------
+# Run records, and the commands built on them
+# ------------------------------------------------------------------------------
+#
+# A run used to leave nothing but files: prompts, reports, logs. There was no way
+# to ask "what did the last run do", "where are its artefacts" or "how do I take
+# this back", so .agent/ could only be read by hand. Every run now also writes a
+# small record, and --status, --history, --show and --undo are all built on it.
+#
+# Two files per run, deliberately plain:
+#   runs/<TS>.meta   key=value scalars, safe to read back without sourcing
+#   runs/<TS>.task   the task text verbatim, since it may be several lines
+
+RUNS_DIR="$WORKFLOW_DIR/runs"
+RUN_META=""
+RUN_ID=""
+RUN_BASE=""
+RUN_RESULT=""
+
+read_meta_value() { # read_meta_value KEY FILE -> value on stdout, "" if absent
+    local line
+    [ -f "$2" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            "$1="*) printf '%s' "${line#*=}"; return 0 ;;
+        esac
+    done < "$2"
+    return 0
+}
+
+one_line() { # one_line TEXT [MAX] -> single truncated line
+    printf '%s' "${1:-}" | tr '\n\r\t' '   ' | tr -s ' ' | cut -c1-"${2:-160}"
+}
+
+current_branch_name() {
+    if [ "$IN_GIT" -ne 1 ]; then
+        printf 'n/a (not a git repository)'
+        return 0
+    fi
+    git symbolic-ref --quiet --short HEAD 2>/dev/null || printf 'detached HEAD'
+}
+
+write_run_record() {
+    local branch
+    [ -n "$RUN_META" ] || return 0
+    branch="$(current_branch_name)"
+    {
+        printf 'ts=%s\n' "$TS"
+        printf 'id=%s\n' "$RUN_ID"
+        printf 'mode=%s\n' "$MODE"
+        printf 'task_file=%s\n' "${RUNS_DIR#"$ROOT"/}/${RUN_ID}.task"
+        printf 'branch=%s\n' "$branch"
+        printf 'base=%s\n' "$RUN_BASE"
+        printf 'created_branch=%s\n' "$BRANCH_CREATED"
+        printf 'result=%s\n' "$RUN_RESULT"
+        printf 'rc=%s\n' "$EXIT_CODE"
+        printf 'started=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    } > "$RUN_META" 2>/dev/null || true
+    return 0
+}
+
+record_run_start() {
+    local n=2
+    # Two runs can land in the same second, and a slow one can collide with a
+    # fast one. The record must never overwrite the other, so the id is made
+    # unique here and used for every file of this run.
+    RUN_ID="$TS"
+    RUN_META="$RUNS_DIR/${TS}.meta"
+    while [ -e "$RUN_META" ]; do
+        RUN_ID="${TS}-${n}"
+        RUN_META="$RUNS_DIR/${TS}-${n}.meta"
+        n=$((n + 1))
+    done
+    RUN_BASE=""
+    RUN_RESULT="running"
+    mkdir -p "$RUNS_DIR" 2>/dev/null || { RUN_META=""; RUN_ID=""; return 0; }
+    if [ -n "$TASK" ]; then
+        printf '%s\n' "$TASK" > "${RUNS_DIR}/${RUN_ID}.task" 2>/dev/null || true
+    fi
+    RUN_BASE="${BASE_BRANCH:-}"
+    write_run_record
+}
+
+record_run_end() {
+    # BASE_BRANCH is only known after the branch step, so the record is written
+    # again here with the real outcome.
+    [ -n "$RUN_META" ] || return 0
+    [ -n "$RUN_BASE" ] || RUN_BASE="${BASE_BRANCH:-}"
+    RUN_RESULT="$1"
+    write_run_record
+}
+
+latest_run_meta() { # latest_run_meta -> path on stdout, "" if no run yet
+    local f
+    for f in "$RUNS_DIR"/*.meta; do
+        [ -f "$f" ] || continue
+        printf '%s' "$f"
+        return 0
+    done
+    return 0
+}
+
+# --- status -----------------------------------------------------------------
+
+context_status_line() { # a one-line age/drift summary
+    local drift behind days built
+    if [ ! -f "$CONTEXT_META" ]; then
+        printf 'not built yet'
+        return 0
+    fi
+    if [ ! -s "$CONTEXT_FILE" ]; then
+        printf 'built but empty'
+        return 0
+    fi
+    built="$(read_meta_value generated "$CONTEXT_META")"
+    drift="$(context_drift)"
+    behind=""
+    days=""
+    case "$drift" in *commits:*) behind="${drift#*commits:}"; behind="${behind%% *}" ;; esac
+    case "$drift" in *days:*)    days="${drift##*days:}" ;; esac
+    case "$behind" in ''|*[!0-9]*) behind=0 ;; esac
+    case "$days" in ''|*[!0-9]*) days=0 ;; esac
+    if [ "$behind" -gt 30 ] || [ "$days" -ge "${AGENT_FLOW_CONTEXT_MAX_DAYS:-30}" ]; then
+        printf 'STALE (%s commits behind, %s days old) -- rebuild with --refresh-context' \
+            "$behind" "$days"
+    elif [ "$behind" -eq 0 ] && [ "$days" -eq 0 ]; then
+        printf 'up to date (built %s)' "${built:-unknown}"
+    else
+        printf '%s commits behind HEAD, %s days old' "$behind" "$days"
+    fi
+}
+
+do_status() {
+    local meta branch result task rc dirty prompt_state report_state
+    meta="$(latest_run_meta)"
+    printf '\n%sagent-flow status%s\n\n' "$C_BOLD" "$C_OFF"
+    printf '  %-16s %s\n' "Repository:" "$ROOT"
+    printf '  %-16s %s\n' "Branch:" "$(current_branch_name)"
+    case "$(current_branch_name)" in
+        agent/*) printf '  %-16s %s\n' "" "this is an agent branch; --undo can take it back" ;;
+    esac
+
+    if [ -n "$meta" ]; then
+        branch="$(read_meta_value branch "$meta")"
+        result="$(read_meta_value result "$meta")"
+        rc="$(read_meta_value rc "$meta")"
+        task="$(one_line "$(cat "${RUNS_DIR}/$(read_meta_value ts "$meta").task" 2>/dev/null || true)" 60)"
+        printf '  %-16s %s\n' "Last run:" "$(read_meta_value ts "$meta") (${result:-unknown}, exit ${rc:-?})"
+        printf '  %-16s %s\n' "  branch:" "${branch:-n/a}"
+        printf '  %-16s %s\n' "  task:" "${task:-(none recorded)}"
+    else
+        printf '  %-16s %s\n' "Last run:" "none recorded yet"
+    fi
+
+    dirty="$(dirty_file_count)"
+    printf '  %-16s %s\n' "Uncommitted:" "$dirty path(s) in the working tree"
+
+    if [ -s "$LATEST_PROMPT" ]; then prompt_state="present"; else prompt_state="absent"; fi
+    if [ -s "$LATEST_REPORT" ]; then report_state="present"; else report_state="absent"; fi
+    printf '  %-16s %s\n' "Prompt:" "$prompt_state ($REL_LATEST_PROMPT)"
+    printf '  %-16s %s\n' "Report:" "$report_state ($REL_LATEST_REPORT)"
+    printf '  %-16s %s\n' "Context:" "$(context_status_line)"
+    printf '  %-16s %s\n' "Models:" \
+        "PE=$(describe_model "$PE_MODEL") CA=$(describe_model "$CODER_MODEL") CB=$(describe_model "$CONTEXT_MODEL")"
+    if [ "$LOCK_HELD" -eq 1 ]; then
+        printf '  %-16s %s\n' "Lock:" "held by this process"
+    elif [ -d "$LOCK_DIR" ]; then
+        printf '  %-16s %s\n' "Lock:" "present (pid $(lock_owner_pid))"
+    else
+        printf '  %-16s %s\n' "Lock:" "free"
+    fi
+    printf '\n'
+    return 0
+}
+
+# --- doctor -----------------------------------------------------------------
+
+check_ok()   { printf '  %sok%s    %-34s %s\n' "$C_GREEN" "$C_OFF" "$1" "${2:-}"; }
+check_warn() { printf '  %swarn%s  %-34s %s\n' "$C_YELLOW" "$C_OFF" "$1" "${2:-}"; }
+check_bad()  { printf '  %sfail%s  %-34s %s\n' "$C_RED" "$C_OFF" "$1" "${2:-}"; }
+
+do_doctor() {
+    local role file n rc=0
+
+    printf '\n%sagent-flow doctor%s\n\n' "$C_BOLD" "$C_OFF"
+
+    if [ "${BASH_VERSINFO[0]}" -gt 3 ] \
+        || { [ "${BASH_VERSINFO[0]}" -eq 3 ] && [ "${BASH_VERSINFO[1]}" -ge 2 ]; }; then
+        check_ok "bash" "${BASH_VERSION} (3.2+ required)"
+    else
+        check_bad "bash" "${BASH_VERSION} is too old, 3.2 is required"; rc=1
+    fi
+
+    if command -v git >/dev/null 2>&1; then
+        check_ok "git" "$(git --version 2>/dev/null | head -1)"
+    else
+        check_bad "git" "not found in PATH"; rc=1
+    fi
+
+    if [ "$IN_GIT" -eq 1 ]; then
+        check_ok "inside a git work tree" "$(current_branch_name)"
+    elif command -v git >/dev/null 2>&1; then
+        check_warn "git repository" "not one -- branches and --undo are unavailable"
+    fi
+
+    if command -v "$OPENCODE_BIN" >/dev/null 2>&1; then
+        check_ok "opencode" "$(command -v "$OPENCODE_BIN")"
+        # A binary that cannot answer `run --help` cannot run an agent either,
+        # so that is a hard failure, not a warning.
+        if "$OPENCODE_BIN" run --help >/dev/null 2>&1; then
+            if opencode_supports_auto; then
+                check_ok "opencode run --auto" "supported"
+            else
+                check_warn "opencode run --auto" "not advertised; agents may stall"
+            fi
+        else
+            check_bad "opencode run --help" "does not work -- no agent can be started"; rc=1
+        fi
+        if "$OPENCODE_BIN" models >/dev/null 2>&1; then
+            check_ok "opencode models" "answering"
+        else
+            check_warn "opencode models" "not answering -- run '$OPENCODE_BIN service start' (--models stays unavailable until then)"
+        fi
+    else
+        check_bad "opencode" "not found in PATH"; rc=1
+    fi
+
+    for role in "Prompt Engineer:$PROMPT_ENGINEER_FILE" \
+                "Coding Agent:$CODING_AGENT_FILE" \
+                "Context Builder:$CONTEXT_BUILDER_FILE"; do
+        file="${role#*:}"
+        name="${role%%:*}"
+        if [ ! -f "$file" ]; then
+            check_bad "agent $name" "missing -- run --setup"
+            rc=1
+        elif ! grep -Fq "$TEMPLATE_MARKER" "$file" 2>/dev/null; then
+            check_warn "agent $name" "outdated -- run --setup --force"
+        else
+            check_ok "agent $name" "up to date"
+        fi
+    done
+
+    if [ -w "$WORKFLOW_DIR" ] && [ -d "$WORKFLOW_DIR" ]; then
+        check_ok "workflow directory" "$WORKFLOW_DIR is writable"
+    else
+        check_bad "workflow directory" "$WORKFLOW_DIR is not writable"; rc=1
+    fi
+
+    if [ "$IN_GIT" -eq 1 ]; then
+        n="$(git check-ignore -q "$WORKFLOW_DIR" 2>/dev/null && echo ignored || echo not-ignored)"
+        if [ "$n" = "ignored" ]; then
+            check_ok "workflow files ignored" "$WORKFLOW_DIR is excluded from git"
+        else
+            check_warn "workflow files ignored" \
+                "$WORKFLOW_DIR is not excluded -- it could be committed by accident"
+        fi
+    fi
+
+    if [ -d "$LOCK_DIR" ]; then
+        check_warn "lock" "present (pid $(lock_owner_pid)); a stale one is reclaimed automatically"
+    else
+        check_ok "lock" "free"
+    fi
+
+    if load_models_conf; then
+        check_ok "remembered models" "loaded from ${MODELS_CONF#"$ROOT"/}"
+        if models_cache_fresh; then
+            for role in PE CODER CONTEXT; do
+                eval "m=\${${role}_MODEL}"
+                [ -n "$m" ] || continue
+                if model_is_available "$m"; then
+                    check_ok "model $role" "$m"
+                else
+                    check_warn "model $role" "$m is not in the current listing -- run --models"
+                fi
+            done
+        else
+            check_warn "model listing" "not cached -- run with AGENT_FLOW_MODELS_REFRESH=1 to check"
+        fi
+    else
+        check_warn "remembered models" "none -- opencode's own default will be used"
+    fi
+
+    printf '\n'
+    if [ "$rc" -eq 0 ]; then
+        check_ok "verdict" "ready to run"
+    else
+        check_bad "verdict" "not ready, see the failures above"
+    fi
+    printf '\n'
+    return "$rc"
+}
+
+# --- history ----------------------------------------------------------------
+
+untracked_file_count() {
+    # Only files the run could have created. `.agent/` and the agent
+    # definitions are excluded from git on purpose, so they must never be
+    # counted here or deleted by --undo.
+    if [ "$IN_GIT" -ne 1 ]; then
+        echo 0
+        return 0
+    fi
+    local n
+    n="$(git ls-files --others --exclude-standard -- . \
+            ':(exclude).agent' ':(exclude).opencode' 2>/dev/null \
+        | wc -l | tr -d ' ' || true)"
+    case "$n" in
+        ''|*[!0-9]*) n=0 ;;
+    esac
+    printf '%s' "$n"
+}
+
+list_dirty_paths() {
+    # Show what is about to be discarded, capped so a large run cannot bury the
+    # question it is being asked as part of.
+    local p shown=0 total
+    [ "$IN_GIT" -eq 1 ] || return 0
+    total="$(dirty_file_count)"
+    [ "$total" -gt 0 ] || return 0
+    printf '\n'
+    git status --porcelain=v1 -- . ':(exclude).agent' ':(exclude).opencode' 2>/dev/null \
+    | while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        shown=$((shown + 1))
+        if [ "$shown" -le 10 ]; then
+            printf '    %s\n' "$p"
+        elif [ "$shown" -eq 11 ]; then
+            printf '    ... and more\n'
+        fi
+    done
+    return 0
+}
+
+do_history() {
+    local f id result rc branch task
+    printf '\n%sagent-flow history%s  (newest first)\n\n' "$C_BOLD" "$C_OFF"
+    if [ ! -d "$RUNS_DIR" ] || [ -z "$(latest_run_meta)" ]; then
+        printf '  No runs recorded yet.\n\n'
+        return 0
+    fi
+    printf '  %-16s %-9s %-28s %s\n' "WHEN" "RESULT" "BRANCH" "TASK"
+    for f in "$RUNS_DIR"/*.meta; do
+        [ -f "$f" ] || continue
+        id="$(read_meta_value id "$f")"
+        [ -n "$id" ] || id="${f##*/}"
+        id="${id%.meta}"
+        result="$(read_meta_value result "$f")"
+        rc="$(read_meta_value rc "$f")"
+        branch="$(read_meta_value branch "$f")"
+        task="$(one_line "$(cat "$RUNS_DIR/${id}.task" 2>/dev/null || true)" 40)"
+        case "$result" in
+            done) result="done" ;;
+            *)    result="${result:-?}${rc:+/$rc}" ;;
+        esac
+        printf '  %-16s %-9s %-28s %s\n' "$(read_meta_value ts "$f")" "$result" "${branch:0:28}" "${task:--}"
+    done
+    printf '\n  Show one with:  %s --show N      (N counts back from the newest)\n\n' "$SELF_NAME"
+    return 0
+}
+
+# --- show -------------------------------------------------------------------
+
+resolve_run_id() { # resolve_run_id N -> run id on stdout
+    local want="${1:-1}" f id i=0
+    for f in "$RUNS_DIR"/*.meta; do
+        [ -f "$f" ] || continue
+        i=$((i + 1))
+        id="${f##*/}"
+        id="${id%.meta}"
+        if [ "$i" -eq "$want" ]; then
+            printf '%s' "$id"
+            return 0
+        fi
+    done
+    return 0
+}
+
+do_show() {
+    local want="${1:-1}" id meta branch result rc prompt report
+    if [ ! -d "$RUNS_DIR" ] || [ -z "$(latest_run_meta)" ]; then
+        die "No runs recorded yet."
+    fi
+    id="$(resolve_run_id "$want")"
+    [ -n "$id" ] || die "There is no run #$want. See: $SELF_NAME --history"
+    meta="$RUNS_DIR/${id}.meta"
+    branch="$(read_meta_value branch "$meta")"
+    result="$(read_meta_value result "$meta")"
+    rc="$(read_meta_value rc "$meta")"
+
+    printf '\n%srun %s%s  mode=%s  result=%s  exit=%s\n' \
+        "$C_BOLD" "$(read_meta_value ts "$meta")" "$C_OFF" \
+        "$(read_meta_value mode "$meta")" "${result:-?}" "${rc:-?}"
+    printf '  branch: %s\n' "${branch:-n/a}"
+    if [ -s "$RUNS_DIR/${id}.task" ]; then
+        printf '\n%sTask%s\n' "$C_BOLD" "$C_OFF"
+        sed 's/^/  /' "$RUNS_DIR/${id}.task"
+    fi
+    prompt="$PROMPT_DIR/history/${id}.md"
+    report="$REPORT_DIR/history/${id}.md"
+    if [ -s "$prompt" ]; then
+        printf '\n%sPrompt%s  (%s)\n' "$C_BOLD" "$C_OFF" "${prompt#"$ROOT"/}"
+        cat "$prompt"
+    fi
+    if [ -s "$report" ]; then
+        printf '\n%sReport%s  (%s)\n' "$C_BOLD" "$C_OFF" "${report#"$ROOT"/}"
+        cat "$report"
+    fi
+    if [ ! -s "$prompt" ] && [ ! -s "$report" ]; then
+        printf '\n  (no archived prompt or report for this run)\n'
+    fi
+    printf '\n'
+    return 0
+}
+
+# --- undo -------------------------------------------------------------------
+
+base_branch_for() { # base_branch_for BRANCH -> the branch it was created from
+    local want="$1" f
+    for f in "$RUNS_DIR"/*.meta; do
+        [ -f "$f" ] || continue
+        if [ "$(read_meta_value branch "$f")" = "$want" ]; then
+            read_meta_value base "$f"
+            return 0
+        fi
+    done
+    return 0
+}
+
+do_undo() {
+    local target base unique dirty untracked
+    if [ "$IN_GIT" -ne 1 ]; then
+        die "--undo needs a git repository; there is nothing to take back."
+    fi
+
+    target="${BRANCH_NAME:-$(current_branch_name)}"
+    case "$target" in
+        agent/*) ;;
+        *)
+            die "Not on an agent branch (you are on '$target').
+--undo only removes branches agent-flow created. Run it on an agent/* branch."
+            ;;
+    esac
+
+    if ! git show-ref --verify --quiet "refs/heads/$target"; then
+        die "Branch '$target' does not exist any more."
+    fi
+
+    # The base is whatever the run recorded; if the record is gone (retention,
+    # manual cleanup) fall back to the merge base with the default branch.
+    base="$(base_branch_for "$target")"
+    if [ -z "$base" ] || ! git show-ref --verify --quiet "refs/heads/$base"; then
+        for candidate in main master trunk develop; do
+            if git show-ref --verify --quiet "refs/heads/$candidate"; then
+                base="$candidate"
+                break
+            fi
+        done
+    fi
+    [ -n "$base" ] || die "Cannot tell which branch '$target' came from, so --undo will not guess. Delete it yourself: git branch -D $target"
+
+    # Commits that exist only on the agent branch are real work. Deleting the
+    # branch would destroy them, so this is refused rather than confirmed.
+    unique="$(git rev-list --count "${base}..${target}" 2>/dev/null || echo 0)"
+    case "$unique" in ''|*[!0-9]*) unique=0 ;; esac
+    if [ "$unique" -gt 0 ]; then
+        warn "Branch '$target' has $unique commit(s) that are not on '$base'."
+        printf '\n  --undo will not delete commits. Keep them:\n'
+        printf '    git switch %s && git cherry-pick <sha>     # take them to %s\n' "$target" "$base"
+        printf '    git switch %s && git log -p               # read them first\n' "$target"
+        printf '  Throw them away on purpose:\n'
+        printf '    git switch %s && git branch -D %s\n' "$base" "$target"
+        printf '\n'
+        return 1
+    fi
+
+    dirty="$(dirty_file_count)"
+    untracked="$(untracked_file_count)"
+    if [ "$dirty" -gt 0 ]; then
+        printf '\n'
+        warn "The working tree has $dirty uncommitted path(s) from the run."
+        list_dirty_paths
+        printf '  Tracked changes will be reset. New files (%s of them) will be deleted.\n' "$untracked"
+        printf '  Keep everything instead:  git stash push -u -m "agent-flow %s"\n' "$target"
+        printf '  Inspect first:           git diff && git status --short\n'
+        if [ "$ASSUME_YES" -ne 1 ]; then
+            printf '  Discard all of it? Type "undo" to confirm: '
+            if ! ask "" ""; then
+                printf '\n'
+                warn "Nothing was changed."
+                return 1
+            fi
+            case "$PROMPT_REPLY" in
+                undo) ;;
+                *) printf '\n'; warn "Nothing was changed."; return 1 ;;
+            esac
+        else
+            warn "--yes: discarding uncommitted work without asking."
+        fi
+        # `reset --hard` only touches tracked files. Anything the agent created
+        # is untracked, so removing it needs `clean` too -- otherwise "discard"
+        # would quietly leave most of the run's work in place.
+        git reset -q --hard "$base" || die "Cannot reset to '$base'."
+        if [ "$untracked" -gt 0 ]; then
+            git clean -qfd -- . ':(exclude).agent' ':(exclude).opencode' 2>/dev/null || true
+        fi
+    else
+        warn "Nothing is uncommitted, so nothing can be lost."
+        git reset -q --hard "$base" || die "Cannot reset to '$base'."
+    fi
+
+    git checkout -q "$base" || die "Cannot switch to '$base'."
+    git branch -q -D "$target" || die "Cannot delete branch '$target'."
+    success "Removed branch '$target'; you are back on '$base'."
+    printf '  %s\n' "Workflow files under .agent/ are kept -- they are only bookkeeping."
+    printf '  %s\n' "Remove them with: rm -rf ${WORKFLOW_DIR#"$ROOT"/}"
+    printf '\n'
+    return 0
+}
+
+ensure_dirs() {
     mkdir -p "$AGENT_DIR" "$PROMPT_DIR/history" "$REPORT_DIR/history" \
-             "$LOG_DIR" "$RUNTIME_DIR" "$CONTEXT_DIR" \
+             "$RUNS_DIR" "$LOG_DIR" "$RUNTIME_DIR" "$CONTEXT_DIR" \
         || die "Cannot create workflow directories under ${WORKFLOW_DIR#"$ROOT"/} (check permissions)."
+}
+
+setup_workflow() {
+    # Only real runs get the full treatment. --doctor must never repair
+    # anything: it would reinstall the very agent files it is about to report as
+    # missing, and then have nothing left to report.
+    ensure_dirs
 
     install_agent_file "$PROMPT_ENGINEER_FILE" write_prompt_engineer "Prompt Engineer"
     install_agent_file "$CODING_AGENT_FILE"    write_coding_agent    "Coding Agent"
@@ -2173,6 +2777,18 @@ opencode_supports_auto() {
     esac
 }
 
+watchdog_job() { # watchdog_job TIMEOUT JOB_PID MARKER
+    sleep "$1" || exit 0
+    # The job may well have finished in the meantime; killing it then would hit
+    # an unrelated process that reused the pid.
+    kill -0 "$2" 2>/dev/null || exit 0
+    : > "$3"
+    kill -TERM "-$2" 2>/dev/null || kill -TERM "$2" 2>/dev/null || true
+    sleep 10
+    kill -KILL "-$2" 2>/dev/null || kill -KILL "$2" 2>/dev/null || true
+    return 0
+}
+
 run_agent() {
     # run_agent RAW_FILE LOG_FILE AGENT MODEL INSTRUCTION [EXTRA_ARGS...]
     #
@@ -2225,16 +2841,19 @@ run_agent() {
     AGENT_PGID="$pid"
 
     if [ -n "$marker" ]; then
-        (
-            sleep "$TIMEOUT" || exit 0
-            if kill -0 "$pid" 2>/dev/null; then
-                : > "$marker"
-                kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-                sleep 10
-                kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-            fi
-        ) &
+        # The watchdog gets its own process group so it can be killed together
+        # with the `sleep` it is sitting in. Without that, killing the watchdog
+        # leaves that `sleep` orphaned: it inherits the script's stdout, so
+        # anything piping this script's output would keep waiting for the pipe to
+        # close -- for the whole timeout -- long after the run was over.
+        set -m
+        watchdog_job "$TIMEOUT" "$pid" "$marker" >/dev/null 2>&1 &
         watchdog=$!
+        set +m
+        # Published so the signal handler can stop it too: a watchdog left running
+        # after Ctrl-C would sit in `sleep` for the rest of the timeout, for
+        # every interrupted run.
+        WATCHDOG_PGID="$watchdog"
     fi
 
     if wait "$pid"; then
@@ -2245,8 +2864,9 @@ run_agent() {
     AGENT_PGID=""
 
     if [ "$watchdog" -gt 0 ]; then
-        kill "$watchdog" 2>/dev/null || true
+        kill -TERM "-$watchdog" 2>/dev/null || kill -TERM "$watchdog" 2>/dev/null || true
         wait "$watchdog" 2>/dev/null || true
+        WATCHDOG_PGID=""
     fi
 
     if [ -n "$marker" ]; then
@@ -2272,6 +2892,7 @@ run_agent() {
 
 LOCK_HELD=0
 AGENT_PGID=""
+WATCHDOG_PGID=""
 
 # shellcheck disable=SC2329  # installed as an EXIT trap
 release_lock() {
@@ -2334,6 +2955,15 @@ on_signal() {
         sleep 1
         kill -KILL "-$AGENT_PGID" 2>/dev/null || kill -KILL "$AGENT_PGID" 2>/dev/null || true
         AGENT_PGID=""
+    fi
+    # The timeout watchdog has to go as well. It is a separate process group, so
+    # killing the agent's group leaves it sitting in `sleep` for the rest of the
+    # timeout -- one stray process per interrupted run.
+    if [ -n "$WATCHDOG_PGID" ] && [ "$WATCHDOG_PGID" != "$$" ]; then
+        kill -TERM "-$WATCHDOG_PGID" 2>/dev/null || kill -TERM "$WATCHDOG_PGID" 2>/dev/null || true
+        sleep 0.2
+        kill -KILL "-$WATCHDOG_PGID" 2>/dev/null || kill -KILL "$WATCHDOG_PGID" 2>/dev/null || true
+        WATCHDOG_PGID=""
     fi
     local dirty=""
     if [ "$IN_GIT" -eq 1 ]; then
@@ -2636,26 +3266,67 @@ $feedback"
     die "Could not build the project context. Log: ${log#"$ROOT"/}"
 }
 
+context_drift() { # context_drift -> "commits:BEHIND days:DAYS", missing parts are empty
+    local saved current n gen built_at now
+    printf ''
+    [ "$IN_GIT" -eq 1 ] || return 0
+    [ -f "$CONTEXT_META" ] || return 0
+    saved="$(read_meta_value commit "$CONTEXT_META")"
+    if [ -n "$saved" ] && [ "$saved" != "none" ]; then
+        current="$(git rev-parse HEAD 2>/dev/null || true)"
+        if [ -n "$current" ] && [ "$saved" != "$current" ]; then
+            n="$(git rev-list --count "${saved}..${current}" 2>/dev/null || echo 0)"
+            case "$n" in ''|*[!0-9]*) n=0 ;; esac
+            printf 'commits:%s ' "$n"
+        fi
+    fi
+    # Age matters even when the commit did not move: a context written three
+    # months ago describes a repository that has since been edited on another
+    # branch, and nothing would have noticed.
+    gen="$(read_meta_value generated "$CONTEXT_META")"
+    if [ -n "$gen" ]; then
+        built_at="$(date -d "$gen" '+%s' 2>/dev/null || date -j -f '%Y-%m-%d %H:%M:%S' "$gen" '+%s' 2>/dev/null || echo '')"
+        now="$(date '+%s')"
+        if [ -n "$built_at" ]; then
+            n=$(( (now - built_at) / 86400 ))
+            [ "$n" -ge 0 ] && printf 'days:%s' "$n"
+        fi
+    fi
+    return 0
+}
+
 ensure_context() {
-    local saved current n
+    local drift behind days reason=""
 
     if [ "$REFRESH_CONTEXT" -eq 1 ] || [ ! -s "$CONTEXT_FILE" ]; then
         build_context
         return 0
     fi
 
-    if [ "$IN_GIT" -eq 1 ] && [ -f "$CONTEXT_META" ]; then
-        saved="$(sed -n 's/^commit=//p' "$CONTEXT_META" 2>/dev/null | head -n 1 || true)"
-        current="$(git rev-parse HEAD 2>/dev/null || true)"
-        if [ -n "$saved" ] && [ "$saved" != "none" ] && [ -n "$current" ] && [ "$saved" != "$current" ]; then
-            n="$(git rev-list --count "${saved}..${current}" 2>/dev/null || echo 0)"
-            case "$n" in
-                ''|*[!0-9]*) n=0 ;;
-            esac
-            if [ "$n" -gt 30 ]; then
-                warn "Project context is $n commits behind HEAD. Rebuild with --refresh-context."
-            fi
+    drift="$(context_drift)"
+    behind=""
+    days=""
+    case "$drift" in
+        *commits:*) behind="${drift#*commits:}"; behind="${behind%% *}"; behind="${behind%%days:*}" ;;
+    esac
+    case "$drift" in
+        *days:*) days="${drift##*days:}" ;;
+    esac
+    case "$behind" in ''|*[!0-9]*) behind=0 ;; esac
+    case "$days" in ''|*[!0-9]*) days=0 ;; esac
+
+    if [ "$behind" -gt 30 ]; then
+        reason="$behind commits behind HEAD"
+    fi
+    if [ "$days" -ge "${AGENT_FLOW_CONTEXT_MAX_DAYS:-30}" ]; then
+        if [ -n "$reason" ]; then
+            reason="$reason and $days days old"
+        else
+            reason="$days days old"
         fi
+    fi
+    if [ -n "$reason" ]; then
+        warn "Project context is stale ($reason). Rebuild with --refresh-context."
     fi
     info "Using existing project context ($REL_CONTEXT)."
 }
@@ -3142,7 +3813,9 @@ if [ "$NO_BRANCH" -eq 1 ] && [ -n "$BRANCH_NAME" ]; then
 fi
 
 if [ "$CHOOSE_MODELS" -eq 0 ] \
-    && [ "$MODE" != "implement-only" ] && [ "$MODE" != "context-only" ] && [ -z "$TASK" ]; then
+    && [ "$MODE" != "implement-only" ] && [ "$MODE" != "context-only" ] \
+    && [ "$MODE" != "status" ] && [ "$MODE" != "doctor" ] && [ "$MODE" != "history" ] \
+    && [ "$MODE" != "undo" ] && [ "$MODE" != "show" ] && [ -z "$TASK" ]; then
     die "No task supplied. Example: ./agent-flow.sh \"Add authentication\""
 fi
 if [ "$CHOOSE_MODELS" -eq 1 ] && [ -n "$TASK" ]; then
@@ -3158,16 +3831,34 @@ if [ "$MODE" = "implement-only" ] && [ "$CONTINUE" -eq 1 ]; then
     warn "--continue has no effect with --implement-only."
 fi
 
+prune_history
+
+# The read-only commands must never queue behind a run, or block one: they take
+# no lock and they never wait for it. They also skip setup_workflow, so that
+# --doctor reports what is actually on disk instead of repairing it first.
+case "$MODE" in
+    status)  ensure_dirs; resolve_models; do_status; exit 0 ;;
+    doctor)  ensure_dirs; resolve_models; do_doctor; exit "$?" ;;
+    history) ensure_dirs; do_history; exit 0 ;;
+    show)    ensure_dirs; do_show "$SHOW_RUN"; exit 0 ;;
+    undo)    ensure_dirs; do_undo || exit 1; exit 0 ;;
+esac
+
 setup_workflow
 acquire_lock
-prune_history
+EXIT_CODE=0
+record_run_start
 
 load_models_conf || true
 if [ "$CHOOSE_MODELS" -eq 1 ]; then
     if ! configure_models; then
-        printf '\n'
-        warn "Model selection cancelled; nothing was changed."
-        exit 0
+        if [ "$PICK_EOF" -eq 1 ]; then
+            printf '\n'
+            warn "Model selection cancelled; nothing was changed."
+            exit 0
+        fi
+        # The details have already been reported by report_models_unavailable.
+        exit 1
     fi
     success "Models saved to ${MODELS_CONF#"$ROOT"/}."
     printf '\n%sPrompt Engineer: %s%s\n%sCoding Agent:    %s%s\n%sContext Builder: %s%s\n' \
@@ -3179,8 +3870,6 @@ fi
 maybe_offer_models
 resolve_models
 print_models_line
-
-EXIT_CODE=0
 
 case "$MODE" in
     context-only)
@@ -3213,6 +3902,12 @@ case "$MODE" in
         execute_prompt || EXIT_CODE=$?
         ;;
 esac
+
+if [ "$EXIT_CODE" -eq 0 ]; then
+    record_run_end "done"
+else
+    record_run_end "failed"
+fi
 
 printf '\n' >&2
 if [ "$EXIT_CODE" -eq 0 ]; then
