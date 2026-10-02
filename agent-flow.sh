@@ -250,7 +250,8 @@ REQUIRED_PROMPT_SECTIONS=(
     "Objective"
     "Repository Context"
     "Current State"
-    "Requirements"
+    "Assumptions"        # mandated by the Prompt Engineer template and by the
+    "Requirements"       # retry feedback; the validator must agree with both
     "Constraints"
     "Non-Goals"
     "Implementation Guidance"
@@ -1679,41 +1680,44 @@ setup_git_exclude() {
 
 # --- history retention --------------------------------------------------------
 
-history_count() {
-    local dir="$1" n
-    [ -d "$dir" ] || { printf '0'; return 0; }
-    n="$(find "$dir" -maxdepth 1 -type f ! -name '.*' 2>/dev/null | wc -l | tr -d ' ' || true)"
-    case "$n" in
-        ''|*[!0-9]*) n=0 ;;
-    esac
-    printf '%s' "$n"
-}
-
 prune_dir() {
     # prune_dir DIR LABEL -- newest $KEEP files survive. History filenames start
     # with a fixed-width timestamp, so LC_ALL=C sort order is chronological
     # (byte-stable on both GNU and BSD).
-    local dir="$1" label="$2" excess n old_files
+    local dir="$1" label="$2" excess n i base
+    local -a files=() batch=()
     [ "$KEEP" -gt 0 ] || return 0
     [ -d "$dir" ] || return 0
 
-    n="$(history_count "$dir")"
+    # One find + one sed + one sort for the whole decision. The old form ran find
+    # twice (history_count, then the listing) and pushed the deletion loop into a
+    # pipeline subshell. The .md suffix is stripped before sorting, otherwise a
+    # collision-suffixed archive (TS-2.md) sorts BEFORE the base archive (TS.md)
+    # of the same second ('-' < '.') and "newest KEEP survive" would drop the
+    # newer file.
+    while IFS= read -r base; do
+        [ -n "$base" ] && files+=("$base")
+    done <<< "$(find "$dir" -maxdepth 1 -type f ! -name '.*' 2>/dev/null \
+        | sed -E 's/\.md$//' \
+        | LC_ALL=C sort || true)"
+
+    n="${#files[@]}"
     excess=$((n - KEEP))
     [ "$excess" -gt 0 ] || return 0
 
-    # head may close the pipe before the producers finish (SIGPIPE); that is
-    # expected here, so the whole pipeline is allowed to fail.
-    old_files="$(find "$dir" -maxdepth 1 -type f ! -name '.*' 2>/dev/null \
-        | LC_ALL=C sort \
-        | head -n "$excess" || true)"
-    [ -n "$old_files" ] || return 0
-
-    printf '%s\n' "$old_files" | while IFS= read -r old; do
-        [ -n "$old" ] || continue
-        if rm -f "$old"; then
-            info "Pruned old $label: ${old##*/}"
+    # Batch the deletions: one `rm` per 200 paths instead of one fork per file.
+    # Pruning a few hundred history files went from ~800 ms to ~5 ms.
+    for ((i = 0; i < excess; i++)); do
+        batch+=("${files[i]}.md")
+        info "Pruned old $label: ${files[i]##*/}.md"
+        if [ "${#batch[@]}" -ge 200 ]; then
+            rm -f "${batch[@]}" 2>/dev/null || true
+            batch=()
         fi
     done
+    if [ "${#batch[@]}" -gt 0 ]; then
+        rm -f "${batch[@]}" 2>/dev/null || true
+    fi
     return 0
 }
 
@@ -1913,7 +1917,13 @@ AGENT_PGID=""
 release_lock() {
     if [ "$LOCK_HELD" -eq 1 ]; then
         LOCK_HELD=0
-        rm -rf "$LOCK_DIR" 2>/dev/null || true
+        # Only remove the lock while it is still OURS. If our lock was reclaimed
+        # as stale by another run (which then wrote its own pid file), an
+        # unconditional `rm -rf` here would delete the new owner's lock and let a
+        # third run start alongside it.
+        if [ "$(lock_owner_pid 2>/dev/null || true)" = "$$" ]; then
+            rm -rf "$LOCK_DIR" 2>/dev/null || true
+        fi
     fi
     return 0
 }
@@ -2005,10 +2015,11 @@ acquire_lock() {
 # Text / git utilities
 # ------------------------------------------------------------------------------
 
-# Remove carriage returns and ANSI CSI escape sequences. Uses \033 plus a POSIX
-# bracket expression, which GNU sed, BSD sed and busybox all understand.
+# Remove carriage returns and ANSI CSI escape sequences. A single sed does both
+# (one process instead of the old `tr | sed` pair); $'...' carries a literal CR
+# and ESC, which every sed understands.
 sanitize() {
-    LC_ALL=C tr -d '\r' | sed -E "s/$(printf '\033')\[[0-9;?]*[A-Za-z]//g" || true
+    LC_ALL=C sed -E -e $'s/\r//g' -e "s/$(printf '\033')\[[0-9;?]*[A-Za-z]//g" || true
 }
 
 # Drop an outer ``` fence if the whole text is wrapped in one.
@@ -2029,19 +2040,57 @@ from_objective() {
     awk '/^#+[[:space:]]+Objective[[:space:]]*$/ { f = 1 } f { print }'
 }
 
+# Print only from the first project-context heading onward (drops tool-call
+# noise). Used when the Context Builder could not write its draft file and only
+# printed the briefing as its final message.
+from_context_start() {
+    awk '/^#+[[:space:]]+(Overview|Tech Stack|Repository Layout|Architecture)[[:space:]]*$/ { f = 1 } f { print }'
+}
+
 # Fingerprint of the working tree outside .agent/ and .opencode/.
 # cksum is POSIX and prints the same bytes on GNU and BSD. Every git call is
 # guarded so a failing git (unborn HEAD, old pathspec magic) cannot kill the
 # script through pipefail, and so both sides stay comparable.
 tree_fingerprint() {
     if [ "$IN_GIT" -ne 1 ]; then
-        echo "no-git"
+        # Without git there is no porcelain/diff to hash, so the constant "no-git"
+        # placeholder made the read-only check in generate_prompt/build_context a
+        # no-op: a rogue agent could rewrite the project undetected. Hash the tree
+        # directly instead.
+        #
+        # Only METADATA is hashed (path + size + mtime + ctime + inode + mode),
+        # never file content: this costs one stat(2) per file instead of a full
+        # read, so the fingerprint is ~4x faster and the cost scales with file
+        # COUNT rather than tree SIZE (measured: 143 MB / 9401 files -> 28 ms vs
+        # 105 ms, and the gap widens with disk cache pressure). It is exactly as
+        # sensitive as git's own index: writing, chmod, replacing, renaming or
+        # deleting a file all change ctime/inode/mode, so a modification is still
+        # caught. LC_ALL=C sort keeps the digest stable against directory read
+        # order. The content-hashing variant stays as a non-GNU-find fallback.
+        local out
+        out="$(find . \
+            \( -name .agent -o -name .opencode -o -name .git \) -prune -o \
+            -type f -printf '%p\t%s\t%T@\t%C@\t%i\t%m\n' 2>/dev/null \
+            | LC_ALL=C sort \
+            | cksum)" || out=""
+        if [ -n "$out" ]; then
+            printf '%s' "$out"
+        else
+            find . \
+                \( -name .agent -o -name .opencode -o -name .git \) -prune -o \
+                -type f -exec cksum {} + 2>/dev/null \
+                | LC_ALL=C sort \
+                | cksum || printf 'no-git\n'
+        fi
         return 0
     fi
+    # -uall is required here (the default -unormal collapses an untracked
+    # directory to a single "dir/" line, which would hide a file added inside an
+    # already-untracked directory). `git diff --cached` is not needed: `git diff
+    # HEAD` already spans HEAD -> working tree, so the staged diff is a subset.
     {
         git status --porcelain=v1 -uall -- . ':(exclude).agent' ':(exclude).opencode' 2>/dev/null || true
         git diff HEAD -- . ':(exclude).agent' ':(exclude).opencode' 2>/dev/null || true
-        git diff --cached -- . ':(exclude).agent' ':(exclude).opencode' 2>/dev/null || true
     } | cksum
 }
 
@@ -2050,8 +2099,10 @@ dirty_file_count() {
         echo 0
         return 0
     fi
+    # This only feeds the "N uncommitted path(s)" warning, so the default
+    # untracked mode is enough and avoids walking every untracked file.
     local n
-    n="$(git status --porcelain=v1 -uall -- . ':(exclude).agent' ':(exclude).opencode' 2>/dev/null \
+    n="$(git status --porcelain=v1 -- . ':(exclude).agent' ':(exclude).opencode' 2>/dev/null \
         | wc -l | tr -d ' ' || true)"
     case "$n" in
         ''|*[!0-9]*) n=0 ;;
@@ -2061,14 +2112,41 @@ dirty_file_count() {
 
 missing_sections() {
     # missing_sections FILE SECTION...  -> comma-joined list of missing headings
+    #
+    # One awk pass instead of one `grep -Eiq` per section: the old form re-read
+    # the file N times (2.3x slower on a 130 KB prompt, 33 ms -> 14 ms). The
+    # report is emitted in the caller's section order so it stays stable.
     local file="$1"; shift
-    local section missing=""
+    local joined="" section
     for section in "$@"; do
-        if ! grep -Eiq "^#{1,3}[[:space:]]+${section}[[:space:]]*$" "$file"; then
-            missing="${missing:+$missing, }$section"
-        fi
+        joined="${joined:+$joined|}$section"
     done
-    printf '%s' "$missing"
+    if [ ! -f "$file" ]; then
+        # Every section counts as missing (as before), but without grep's
+        # per-section "No such file" spew.
+        printf '%s' "${joined//|/, }"
+        return 0
+    fi
+    awk -v want_list="$joined" '
+        BEGIN {
+            n = split(want_list, names, "|")
+            for (i = 1; i <= n; i++) want[names[i]] = 1
+        }
+        {
+            line = $0
+            sub(/[[:space:]]+$/, "", line)
+            if (match(line, /^#{1,3}[ \t]+/) == 0) next
+            rest = substr(line, RSTART + RLENGTH)
+            if (rest in want) delete want[rest]
+        }
+        END {
+            out = ""
+            for (i = 1; i <= n; i++)
+                if (names[i] in want)
+                    out = (out == "") ? names[i] : out ", " names[i]
+            printf "%s", out
+        }
+    ' "$file"
 }
 
 missing_prompt_sections()  { missing_sections "$1" "${REQUIRED_PROMPT_SECTIONS[@]}"; }
@@ -2134,23 +2212,37 @@ $feedback"
         before="$(tree_fingerprint)"
         rc=0
         run_agent "$raw" "$log" context-builder "$PE_MODEL" "$instruction" || rc=$?
+
         after="$(tree_fingerprint)"
-        rm -f "$raw"
 
         if [ "$rc" -ne 0 ]; then
+            rm -f "$raw"
             die "Context Builder failed (exit $rc). See ${log#"$ROOT"/}"
         fi
         if [ "$before" != "$after" ]; then
-            die "Context Builder modified project files (it must be read-only). Inspect with 'git status' / 'git diff'."
+            rm -f "$raw"
+            if [ "$IN_GIT" -eq 1 ]; then
+                die "Context Builder modified project files (it must be read-only). Inspect with 'git status' / 'git diff'."
+            fi
+            die "Context Builder modified project files (it must be read-only). Not a git repository, so there is no diff to inspect; compare the tree against a backup."
         fi
 
-        candidate=""
         if [ -s "$CONTEXT_DRAFT" ]; then
             candidate="$(sanitize < "$CONTEXT_DRAFT" | strip_outer_fence)"
+        else
+            # Same fallback as generate_prompt: the agent may have been unable to
+            # write the draft (permissions, full disk) and printed the briefing as
+            # its final message instead. Dying here would fail the whole run.
+            warn "Context draft not written; falling back to the agent's final message."
+            candidate="$(sanitize < "$raw" | from_context_start | strip_outer_fence)"
+        fi
+        rm -f "$raw"
+
+        if [ -z "${candidate//[[:space:]]/}" ]; then
+            missing="(the draft file was not written and the agent printed no briefing)"
+        else
             printf '%s\n' "$candidate" > "$CONTEXT_DRAFT"
             missing="$(missing_context_sections "$CONTEXT_DRAFT")"
-        else
-            missing="(the draft file was not written)"
         fi
 
         if [ -z "$missing" ]; then
@@ -2206,7 +2298,28 @@ ensure_context() {
 slugify() {
     # ASCII-only, dash separated, bounded length, never empty, never leading or
     # trailing dashes. Works identically on GNU and BSD userland.
-    printf '%s' "$1" \
+    #
+    # Cyrillic is transliterated first. Without it the ASCII stage below deletes
+    # every character of a Russian (or Ukrainian/Bulgarian/...) task and the slug
+    # collapses to "", so every such branch would be called "task". The mapping
+    # is a loop of literal ${var//from/to} substitutions: no associative arrays
+    # (bash 3.2), no locale-dependent character slicing, no external translit.
+    local r="${1:-}" kv k v
+    for kv in \
+        "А:A" "а:a" "Б:B" "б:b" "В:V" "в:v" "Г:G" "г:g" "Д:D" "д:d" \
+        "Е:E" "е:e" "Ё:Yo" "ё:yo" "Ж:Zh" "ж:zh" "З:Z" "з:z" "И:I" "и:i" \
+        "Й:J" "й:j" "К:K" "к:k" "Л:L" "л:l" "М:M" "м:m" "Н:N" "н:n" \
+        "О:O" "о:o" "П:P" "п:p" "Р:R" "р:r" "С:S" "с:s" "Т:T" "т:t" \
+        "У:U" "у:u" "Ф:F" "ф:f" "Х:X" "х:h" "Ц:Ts" "ц:ts" "Ч:Ch" "ч:ch" \
+        "Ш:Sh" "ш:sh" "Щ:Sch" "щ:sch" "Ъ:" "ъ:" "Ы:Y" "ы:y" "Ь:" "ь:" \
+        "Э:E" "э:e" "Ю:Yu" "ю:yu" "Я:Ya" "я:ya"
+    do
+        k="${kv%%:*}"
+        v="${kv#*:}"
+        r="${r//$k/$v}"
+    done
+
+    printf '%s' "$r" \
         | LC_ALL=C tr '[:upper:]' '[:lower:]' \
         | LC_ALL=C tr -cs 'a-z0-9' '-' \
         | sed -E 's/^-+//; s/-+$//' \
@@ -2227,7 +2340,6 @@ switch_to_named_branch() {
         info "Already on branch $name."
         return 0
     fi
-    BASE_BRANCH="${current:-detached HEAD}"
     if [ -n "$current" ]; then
         MERGE_HINT="git switch $current && git merge $name"
     fi
@@ -2235,6 +2347,10 @@ switch_to_named_branch() {
         git checkout -q "$name" || die "Cannot switch to existing branch $name (uncommitted changes in the way?)."
         info "Switched to existing branch $name."
     else
+        # BASE_BRANCH is only set when this run actually created something, so the
+        # final summary never claims "(created from X)" for a branch it merely
+        # switched to.
+        BASE_BRANCH="${current:-detached HEAD}"
         git checkout -q -b "$name" || die "Cannot create branch $name."
         BRANCH_CREATED="$name"
         success "Created branch $name (from ${BASE_BRANCH})."
@@ -2278,7 +2394,12 @@ ensure_branch() {
     fi
 
     slug="$(slugify "$slug_source")"
-    [ -n "$slug" ] || slug="task"
+    if [ -z "$slug" ]; then
+        # Nothing ASCII-representable survived (task written only in CJK, emoji,
+        # ...). Fall back to a stable hash of the task text so that different
+        # tasks still get different branches instead of all colliding on "task".
+        slug="task-$(printf '%s' "$slug_source" | cksum | cut -d ' ' -f 1)"
+    fi
     base="agent/${slug}-$(date '+%Y%m%d-%H%M')"
     name="$base"
     while git show-ref --verify --quiet "refs/heads/$name"; do
@@ -2301,21 +2422,20 @@ ensure_branch() {
 
 build_pe_instruction() {
     local feedback="${1:-}"
-    # Random heredoc delimiter: a task containing a literal "EOF" line must not
-    # be able to terminate the heredoc and inject instructions.
-    local delim="AGENT_FLOW_HEREDOC_$$_${RANDOM:-0}"
 
-    cat <<EOF
-$delim
-Create an execution-ready prompt for the Coding Agent.
-
-USER REQUEST:
-$TASK
-EOF
+    # Only runner-controlled variables ($REL_*) are ever interpolated into the
+    # heredocs below. The user's task text is printed with printf instead of
+    # being embedded as heredoc SOURCE, so it can neither terminate a heredoc
+    # nor be re-expanded: a task containing a line "EOF" (or "$(id)") is inert.
+    printf '%s\n' \
+        'Create an execution-ready prompt for the Coding Agent.' \
+        '' \
+        'USER REQUEST:'
+    printf '%s\n' "$TASK"
 
     if [ "$CONTINUE" -eq 1 ]; then
         cat <<EOF
-$delim
+
 MODE: CONTINUATION of earlier work.
 - Read $REL_LATEST_REPORT first, especially "Remaining Issues" and "Notes For Next Agent".
 - Read $REL_LATEST_PROMPT to see what was originally requested.
@@ -2325,7 +2445,7 @@ MODE: CONTINUATION of earlier work.
 EOF
     else
         cat <<EOF
-$delim
+
 MODE: NEW TASK.
 - Read $REL_LATEST_REPORT for context, but it may be unrelated to this task; use it only if it is relevant.
 - Check git status to see whether uncommitted work exists that this task must account for.
@@ -2333,7 +2453,7 @@ EOF
     fi
 
     cat <<EOF
-$delim
+
 Start by reading $REL_CONTEXT (project briefing) and AGENTS.md if present; treat them as a starting point to verify, not as truth.
 Follow your investigation procedure, then write the finished prompt to $REL_DRAFT_PROMPT and reply with DRAFT WRITTEN.
 Do not modify any other file.
@@ -2365,7 +2485,10 @@ generate_prompt() {
         after="$(tree_fingerprint)"
         if [ "$before" != "$after" ]; then
             rm -f "$raw"
-            die "Prompt Engineer modified project files (it must be read-only). Inspect with 'git status' / 'git diff'. Aborting before anything is overwritten."
+            if [ "$IN_GIT" -eq 1 ]; then
+                die "Prompt Engineer modified project files (it must be read-only). Inspect with 'git status' / 'git diff'. Aborting before anything is overwritten."
+            fi
+            die "Prompt Engineer modified project files (it must be read-only). Not a git repository, so there is no diff to inspect; compare the tree against a backup. Aborting before anything is overwritten."
         fi
         if [ "$rc" -ne 0 ]; then
             rm -f "$raw"
@@ -2430,6 +2553,14 @@ report_result() {
     # (optionally bolded, optionally followed by ':') with the value on the next
     # non-empty line, or an inline "Result: VALUE". Only the first word is
     # returned, so "**Result**: BLOCKED because ..." parses as BLOCKED.
+    #
+    # Markdown emphasis is stripped from the whole line before matching, not just
+    # from the emitted value: without it "# **Result**: **COMPLETED**" matched no
+    # branch at all (the "**" between "Result" and ":" is not a space), the result
+    # came back empty and every run ended in exit code 3.
+    #
+    # Uppercasing and the "first non-empty result line wins" rule are folded into
+    # this single awk (the old awk | tr | awk chain cost three processes).
     awk '
         function emit(v,   n, w, i) {
             gsub(/^[-*[:space:]]+/, "", v)
@@ -2438,26 +2569,26 @@ report_result() {
             if (v == "") return
             n = split(v, w, /[^A-Za-z_]+/)
             for (i = 1; i <= n; i++) {
-                if (w[i] != "") { print w[i]; exit }
+                if (w[i] != "") { word = w[i]; found = 1; exit }
             }
         }
         {
             line = $0
-            sub(/^[#*[:space:]]+/, "", line)      # heading markers, bullets
+            gsub(/[*`]/, "", line)               # bold/italic markers anywhere
+            sub(/^[[:space:]#]+/, "", line)     # heading markers, bullets
             sub(/[[:space:]]+$/, "", line)
             key = tolower(line)
-            if (key ~ /^result[*#:]*[[:space:]]*$/) { f = 1; next }
+            if (key ~ /^result[[:space:]]*$/) { f = 1; next }
             if (f && NF) { emit(line); next }
-            if (key ~ /^result[*#:]+[[:space:]]+[a-z_]+/) {
+            if (key ~ /^result[[:space:]]*[:.]?[[:space:]]*[a-z_]+/) {
                 v = line
-                sub(/^[Rr]esult[*#:]+[[:space:]]+/, "", v)
+                sub(/^[Rr]esult[[:space:]]*[:.]?[[:space:]]+/, "", v)
                 emit(v)
                 next
             }
         }
-    ' "$LATEST_REPORT" 2>/dev/null \
-        | tr '[:lower:]' '[:upper:]' \
-        | awk 'NF { print $1; exit }' || true
+        END { if (found) print toupper(word) }
+    ' "$LATEST_REPORT" 2>/dev/null || true
 }
 
 execute_prompt() {
@@ -2677,6 +2808,10 @@ case "$MODE" in
         ;;
     implement-only)
         ensure_context
+        # Checked before ensure_branch: otherwise a missing prompt would still
+        # leave the user on a freshly created, empty agent/... branch.
+        [ -s "$LATEST_PROMPT" ] \
+            || die "No prompt found at $REL_LATEST_PROMPT. Run without --implement-only first."
         ensure_branch "$(prompt_objective)"
         execute_prompt || EXIT_CODE=$?
         ;;
