@@ -48,8 +48,10 @@ TEMPLATE_MARKER="agent-flow-template: ${TEMPLATE_VERSION}"
 if [ -t 2 ]; then
     C_BLUE=$'\033[1;34m'; C_GREEN=$'\033[1;32m'
     C_YELLOW=$'\033[1;33m'; C_RED=$'\033[1;31m'; C_OFF=$'\033[0m'
+    C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
 else
     C_BLUE=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_OFF=""
+    C_DIM=""; C_BOLD=""
 fi
 
 info()    { printf '%s[agent-flow]%s %s\n' "$C_BLUE"   "$C_OFF" "$*" >&2; }
@@ -73,6 +75,7 @@ Usage:
   agent-flow.sh --context-only                 Only (re)build the project context
   agent-flow.sh --verify-agents                Check that opencode loads our agent definitions
   agent-flow.sh --task-file FILE               Read the task from a file
+  agent-flow.sh --models                       Pick the models interactively, then exit
   echo "task" | agent-flow.sh                  Read the task from stdin
 
 Options:
@@ -85,12 +88,16 @@ Options:
   --no-auto              Do not pass --auto to `opencode run` (stricter, may stall)
   --pe-model MODEL       Model for Prompt Engineer (provider/model)
   --coder-model MODEL    Model for Coding Agent    (provider/model)
+  --context-model MODEL  Model for Context Builder (defaults to the PE model)
+  --models               Interactively pick the models and save them for this repo
   --force                With --setup: overwrite existing agent definitions
   -h, --help             Show this help
 
 Environment:
   AGENT_FLOW_PE_MODEL       Model for Prompt Engineer
   AGENT_FLOW_CODER_MODEL    Model for Coding Agent
+  AGENT_FLOW_CONTEXT_MODEL  Model for Context Builder
+  AGENT_FLOW_MODELS_TTL     Seconds to reuse the cached model list (default 86400)
   AGENT_FLOW_KEEP           History/log retention (default 100, 0 = unlimited)
   AGENT_FLOW_TIMEOUT        Per-agent-call timeout in seconds (default 0)
   AGENT_FLOW_LOCK_WAIT      Lock wait in seconds (default 0)
@@ -105,6 +112,10 @@ Exit codes:
 
 Always-on behavior:
   * Project context (.agent/context/PROJECT.md) is built on first run.
+  * On the first run in a repository you are offered a one-time model picker;
+    the choice is remembered in .agent/models.conf and every later run just
+    prints which models it is using. Re-pick any time with --models.
+  * An empty model means "no --model flag", i.e. the opencode default is used.
   * A new branch agent/<task-slug>-<timestamp> is created unless you are
     already on an agent/* branch (or use --branch / --no-branch).
   * Workflow files are excluded via .git/info/exclude, never committed.
@@ -141,6 +152,11 @@ if [ "${AGENT_FLOW_AUTO:-1}" = "0" ]; then
 fi
 PE_MODEL="${AGENT_FLOW_PE_MODEL:-}"
 CODER_MODEL="${AGENT_FLOW_CODER_MODEL:-}"
+CONTEXT_MODEL="${AGENT_FLOW_CONTEXT_MODEL:-}"
+PE_MODEL_FLAGGED=0
+CODER_MODEL_FLAGGED=0
+CONTEXT_MODEL_FLAGGED=0
+CHOOSE_MODELS=0
 OPENCODE_BIN="${AGENT_FLOW_OPENCODE_BIN:-opencode}"
 OPENCODE_EXTRA_ARGS="${AGENT_FLOW_OPENCODE_ARGS:-}"
 OPENCODE_HAS_AUTO=""
@@ -177,10 +193,14 @@ while [ $# -gt 0 ]; do
             TASK_FILE="$2"; shift ;;
         --pe-model)
             need_value "$1" "$#"
-            PE_MODEL="$2"; shift ;;
+            PE_MODEL="$2"; PE_MODEL_FLAGGED=1; shift ;;
         --coder-model)
             need_value "$1" "$#"
-            CODER_MODEL="$2"; shift ;;
+            CODER_MODEL="$2"; CODER_MODEL_FLAGGED=1; shift ;;
+        --context-model)
+            need_value "$1" "$#"
+            CONTEXT_MODEL="$2"; CONTEXT_MODEL_FLAGGED=1; shift ;;
+        --models|--choose-models) CHOOSE_MODELS=1 ;;
         --)
             shift
             TASK="${TASK:+$TASK }$*"
@@ -1729,6 +1749,346 @@ prune_history() {
     return 0
 }
 
+# ------------------------------------------------------------------------------
+# Model selection
+# ------------------------------------------------------------------------------
+#
+# The candidate list comes from `opencode models`, i.e. exactly the models this
+# account can currently reach -- no hardcoded catalogue that goes stale. That
+# call queries the opencode server and costs ~0.4s, so the listing is cached
+# under .agent/runtime and only refreshed when it is actually needed.
+#
+# Choices are remembered per repository in .agent/models.conf (which never
+# reaches git) instead of being asked for on every run: the first run in a
+# repository offers the picker once, every later run just states which models it
+# is about to use and mentions --models. Re-asking each time would mean scrolling
+# a few hundred lines per run, and would break any non-interactive use.
+#
+# An empty value means "do not pass --model at all", i.e. let opencode apply its
+# own configured default. That is a legitimate choice and the picker offers it
+# explicitly rather than silently falling back to it.
+
+MODELS_CONF="$WORKFLOW_DIR/models.conf"
+MODELS_CACHE="$RUNTIME_DIR/models.list"
+MODELS_CACHE_TS="$RUNTIME_DIR/models.list.ts"
+MODELS_TTL="${AGENT_FLOW_MODELS_TTL:-86400}"
+
+SAVED_PE_MODEL=""
+SAVED_CODER_MODEL=""
+SAVED_CONTEXT_MODEL=""
+PICK_RESULT=""
+
+is_interactive() {
+    # A picker must never be able to hang a script, a cron job or CI.
+    [ -t 0 ] && [ -t 1 ]
+}
+
+PROMPT_REPLY=""
+PICK_EOF=0
+ask() { # ask TEXT PROMPT -> PROMPT_REPLY; returns 1 on EOF (Ctrl-D, closed stdin)
+    PROMPT_REPLY=""
+    printf '%s' "$2"
+    IFS= read -r PROMPT_REPLY || return 1
+    return 0
+}
+
+set_saved_model() { # KEY VALUE
+    case "$1" in
+        PE_MODEL)      SAVED_PE_MODEL="$2" ;;
+        CODER_MODEL)   SAVED_CODER_MODEL="$2" ;;
+        CONTEXT_MODEL) SAVED_CONTEXT_MODEL="$2" ;;
+    esac
+}
+
+load_models_conf() {
+    # Parsed line by line rather than sourced: a hand-edited or corrupt file must
+    # not be able to turn into executable code.
+    SAVED_PE_MODEL=""
+    SAVED_CODER_MODEL=""
+    SAVED_CONTEXT_MODEL=""
+    [ -f "$MODELS_CONF" ] || return 1
+    local line key value found=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ''|\#*) continue ;;
+            *=*) ;;
+            *) continue ;;
+        esac
+        key="${line%%=*}"
+        value="${line#*=}"
+        case "$key" in
+            PE_MODEL|CODER_MODEL|CONTEXT_MODEL) found=1 ;;
+            *) continue ;;
+        esac
+        value="${value%%#*}"
+        value="${value%\"}"; value="${value#\"}"
+        value="${value%\'}"; value="${value#\'}"
+        set_saved_model "$key" "$value"
+    done < "$MODELS_CONF"
+    [ "$found" -eq 1 ]
+}
+
+save_models_conf() {
+    {
+        printf '# Models chosen for this repository by agent-flow.\n'
+        printf '# Edit freely, or re-run: agent-flow.sh --models\n'
+        printf '# An empty value means: do not pass --model, use the opencode default.\n'
+        printf 'PE_MODEL=%s\n'      "$SAVED_PE_MODEL"
+        printf 'CODER_MODEL=%s\n'   "$SAVED_CODER_MODEL"
+        printf 'CONTEXT_MODEL=%s\n' "$SAVED_CONTEXT_MODEL"
+    } > "$MODELS_CONF" 2>/dev/null \
+        || die "Cannot write ${MODELS_CONF#"$ROOT"/} (check permissions)."
+}
+
+refresh_models_cache() {
+    local raw
+    raw="$RUNTIME_DIR/models.raw.$$"
+    "$OPENCODE_BIN" models > "$raw" 2>/dev/null || { rm -f "$raw"; return 1; }
+    # Keep only well-formed provider/model lines and drop duplicates.
+    grep -E '^[^[:space:]/]+/[^[:space:]]+$' "$raw" 2>/dev/null \
+        | LC_ALL=C sort -u > "$MODELS_CACHE" || { rm -f "$raw"; return 1; }
+    rm -f "$raw"
+    [ -s "$MODELS_CACHE" ] || return 1
+    date '+%s' > "$MODELS_CACHE_TS" 2>/dev/null || : > "$MODELS_CACHE_TS"
+    return 0
+}
+
+models_cache_fresh() {
+    [ -s "$MODELS_CACHE" ] && [ -s "$MODELS_CACHE_TS" ] || return 1
+    local ts now age
+    ts="$(cat "$MODELS_CACHE_TS" 2>/dev/null || printf 0)"
+    case "$ts" in ''|*[!0-9]*) return 1 ;; esac
+    now="$(date '+%s' 2>/dev/null || printf 0)"
+    case "$now" in ''|*[!0-9]*) return 1 ;; esac
+    age=$((now - ts))
+    [ "$age" -ge 0 ] && [ "$age" -le "$MODELS_TTL" ]
+}
+
+ensure_models_cache() {
+    models_cache_fresh && return 0
+    refresh_models_cache
+}
+
+model_is_available() { # MODEL -> 0 available, 1 confirmed gone, 2 unknown
+    models_cache_fresh || return 2
+    grep -Fxq -- "$1" "$MODELS_CACHE" 2>/dev/null && return 0
+    return 1
+}
+
+render_models_menu() { # FILE  -- prints the numbered list, entry 0 = opencode default
+    local file="$1" line provider="" last="" n=1
+    printf '\n'
+    printf '    %s0%s  (opencode default -- no --model flag is passed)\n' "$C_DIM" "$C_OFF"
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        provider="${line%%/*}"
+        if [ "$provider" != "$last" ]; then
+            printf '\n  %s%s/%s\n' "$C_DIM" "$provider" "$C_OFF"
+            last="$provider"
+        fi
+        printf '    %s%3d%s  %s\n' "$C_DIM" "$n" "$C_OFF" "$line"
+        n=$((n + 1))
+    done < "$file"
+    printf '\n'
+}
+
+pick_model() { # pick_model ROLE CURRENT -> sets PICK_RESULT and PICK_EOF
+    local role="$1" current="$2"
+    local candidates="$MODELS_CACHE" reply n idx line
+    local narrowed=""
+    local -a items=()
+
+    PICK_EOF=0
+    if ! is_interactive; then
+        PICK_RESULT="$current"
+        return 0
+    fi
+    if ! ensure_models_cache; then
+        warn "Cannot list models via '$OPENCODE_BIN models'; keeping the current choice."
+        PICK_RESULT="$current"
+        return 0
+    fi
+
+    while :; do
+        items=()
+        while IFS= read -r line; do
+            [ -n "$line" ] && items+=("$line")
+        done < "$candidates"
+        if [ "${#items[@]}" -eq 0 ]; then
+            warn "No model matches that filter."
+            rm -f "$candidates" 2>/dev/null || true
+            candidates="$MODELS_CACHE"
+            continue
+        fi
+
+        printf '%sModel for the %s%s' "$C_BOLD" "$role" "$C_OFF"
+        if [ -n "$current" ]; then
+            printf '  %s(current: %s)%s' "$C_DIM" "$current" "$C_OFF"
+        else
+            printf '  %s(current: opencode default)%s' "$C_DIM" "$C_OFF"
+        fi
+        printf '\n'
+        render_models_menu "$candidates"
+
+        # Ctrl-D means "cancel", not "keep the default": answer it once and the
+        # whole configuration is abandoned instead of asking three more questions
+        # that can no longer be read.
+        if ! ask "" "  Number, or part of a name to filter (empty = keep current): "; then
+            PICK_EOF=1
+            PICK_RESULT="$current"
+            rm -f "$narrowed" 2>/dev/null || true
+            [ "$candidates" = "$MODELS_CACHE" ] || rm -f "$candidates" 2>/dev/null || true
+            return 0
+        fi
+        reply="$PROMPT_REPLY"
+
+        case "$reply" in
+            '')   PICK_RESULT="$current"; rm -f "$narrowed" 2>/dev/null || true; return 0 ;;
+            *[!0-9]*)
+                # Not a number: treat it as a case-insensitive substring filter.
+                narrowed="$RUNTIME_DIR/models.filter.$$"
+                grep -i -F -e "$reply" "$MODELS_CACHE" > "$narrowed" 2>/dev/null || true
+                if [ -s "$narrowed" ]; then
+                    # Only ever discard our own temp file, never the cache.
+                    [ "$candidates" = "$MODELS_CACHE" ] || rm -f "$candidates" 2>/dev/null || true
+                    candidates="$narrowed"
+                else
+                    rm -f "$narrowed" 2>/dev/null || true
+                    warn "No model matches '$reply'; showing the full list."
+                fi
+                ;;
+            *)
+                n="$reply"
+                idx=$((n - 1))
+                if [ "$n" -eq 0 ]; then
+                    PICK_RESULT=""
+                elif [ "$idx" -ge 0 ] && [ "$idx" -lt "${#items[@]}" ]; then
+                    PICK_RESULT="${items[$idx]}"
+                else
+                    warn "There is no model number $n."
+                    continue
+                fi
+                rm -f "$narrowed" 2>/dev/null || true
+                [ "$candidates" = "$MODELS_CACHE" ] || rm -f "$candidates" 2>/dev/null || true
+                return 0
+                ;;
+        esac
+    done
+}
+
+configure_models() {
+    if ! is_interactive; then
+        die "--models needs an interactive terminal. In scripts, pass --pe-model / --coder-model instead."
+    fi
+    if ! ensure_models_cache; then
+        die "Cannot list models via '$OPENCODE_BIN models'. Is \`opencode\` installed and authenticated?"
+    fi
+
+    pick_model "Prompt Engineer" "$SAVED_PE_MODEL"
+    [ "$PICK_EOF" -eq 0 ] || return 1
+    SAVED_PE_MODEL="$PICK_RESULT"
+
+    pick_model "Coding Agent" "$SAVED_CODER_MODEL"
+    [ "$PICK_EOF" -eq 0 ] || return 1
+    SAVED_CODER_MODEL="$PICK_RESULT"
+
+    # The Context Builder maps the whole repository: a lot of work that a faster,
+    # cheaper model handles well. One extra keypress to give it its own.
+    printf '\n%sContext Builder%s  [1] share the Prompt Engineer model  [2] pick separately: ' \
+        "$C_BOLD" "$C_OFF"
+    if ! ask "" ""; then
+        PICK_EOF=1
+        return 1
+    fi
+    if [ "$PROMPT_REPLY" = "2" ]; then
+        pick_model "Context Builder" "$SAVED_CONTEXT_MODEL"
+        [ "$PICK_EOF" -eq 0 ] || return 1
+        SAVED_CONTEXT_MODEL="$PICK_RESULT"
+    else
+        SAVED_CONTEXT_MODEL=""
+    fi
+    save_models_conf
+    return 0
+}
+
+maybe_offer_models() {
+    # Offered once, on the first real run in a repository, and never when the
+    # caller is not a terminal or has already stated a model explicitly.
+    case "$MODE" in
+        run|prompt-only|implement-only|context-only) ;;
+        *) return 0 ;;
+    esac
+    [ "$PE_MODEL_FLAGGED" -eq 0 ] && [ "$CODER_MODEL_FLAGGED" -eq 0 ] && [ "$CONTEXT_MODEL_FLAGGED" -eq 0 ] \
+        || return 0
+    load_models_conf && return 0
+    is_interactive || return 0
+    printf '\n'
+    info "No models configured for this repository yet."
+    # Ctrl-D here means "not now", not "yes": falling through would only lead to
+    # three more questions that can no longer be answered.
+    ask "" "  Pick them now? [Y/n] " || return 0
+    case "$PROMPT_REPLY" in
+        n|N|no|No) return 0 ;;
+    esac
+    configure_models || {
+        printf '\n'
+        warn "Model selection cancelled; nothing was changed."
+        return 0
+    }
+    printf '\n'
+    info "Models saved to ${MODELS_CONF#"$ROOT"/}. Change them any time with --models."
+}
+
+resolve_models() {
+    # Precedence: command-line flag > environment > remembered choice > let
+    # opencode decide. Only remembered values are validated: an explicit flag is
+    # taken at face value, because the caller may know about a model the listing
+    # does not mention.
+    local role flagged env_value saved
+    for role in PE CODER CONTEXT; do
+        flagged=0
+        eval "flagged=\${${role}_MODEL_FLAGGED}"
+        eval "env_value=\${AGENT_FLOW_${role}_MODEL:-}"
+        eval "saved=\${SAVED_${role}_MODEL}"
+        if [ "$flagged" -eq 0 ] && [ -z "$env_value" ] && [ -n "$saved" ]; then
+            validate_saved_model "$role" "$saved"
+            eval "${role}_MODEL=\$saved"
+        fi
+    done
+    # The Context Builder follows the Prompt Engineer unless told otherwise.
+    [ -n "$CONTEXT_MODEL" ] || CONTEXT_MODEL="$PE_MODEL"
+}
+
+validate_saved_model() { # ROLE MODEL
+    local role="$1" model="$2" rc
+    [ -n "$model" ] || return 0
+    # `if` rather than `cmd; rc=$?`: under `set -e` a bare failing command would
+    # abort the whole script before rc was ever assigned.
+    if model_is_available "$model"; then
+        return 0
+    else
+        rc=$?
+    fi
+    case "$rc" in
+        0) return 0 ;;
+        # No fresh listing: trust the stored value rather than paying for a
+        # network call on every single run.
+        2) return 0 ;;
+        *) die "The model remembered for the $role is no longer available: $model
+Pick another one with:  ./agent-flow.sh --models
+Or override it for this run with the matching --*-model flag." ;;
+    esac
+}
+
+describe_model() { # MODEL -> printable
+    [ -n "$1" ] && printf '%s' "$1" || printf 'opencode default'
+}
+
+print_models_line() {
+    info "Models: Prompt Engineer=$(describe_model "$PE_MODEL") | Coding Agent=$(describe_model "$CODER_MODEL") | Context Builder=$(describe_model "$CONTEXT_MODEL")"
+    info "Change with --models, or per-run with --pe-model / --coder-model / --context-model."
+}
+
 setup_workflow() {
     mkdir -p "$AGENT_DIR" "$PROMPT_DIR/history" "$REPORT_DIR/history" \
              "$LOG_DIR" "$RUNTIME_DIR" "$CONTEXT_DIR" \
@@ -1975,7 +2335,16 @@ on_signal() {
         kill -KILL "-$AGENT_PGID" 2>/dev/null || kill -KILL "$AGENT_PGID" 2>/dev/null || true
         AGENT_PGID=""
     fi
-    warn "Received SIG$1 — stopping. The lock is released and nothing is committed."
+    local dirty=""
+    if [ "$IN_GIT" -eq 1 ]; then
+        dirty="$(dirty_file_count 2>/dev/null || printf 0)"
+    fi
+    if [ -n "$dirty" ] && [ "$dirty" -gt 0 ] 2>/dev/null; then
+        warn "Received SIG$1 — stopping. The lock is released and nothing was committed."
+        warn "The working tree has $dirty uncommitted path(s) from the partial run: review with 'git diff' before you re-run."
+    else
+        warn "Received SIG$1 — stopping. The lock is released and nothing was committed."
+    fi
     exit "$2"
 }
 
@@ -2211,7 +2580,7 @@ $feedback"
 
         before="$(tree_fingerprint)"
         rc=0
-        run_agent "$raw" "$log" context-builder "$PE_MODEL" "$instruction" || rc=$?
+        run_agent "$raw" "$log" context-builder "$CONTEXT_MODEL" "$instruction" || rc=$?
 
         after="$(tree_fingerprint)"
 
@@ -2772,8 +3141,12 @@ if [ "$NO_BRANCH" -eq 1 ] && [ -n "$BRANCH_NAME" ]; then
     die "--branch and --no-branch are mutually exclusive."
 fi
 
-if [ "$MODE" != "implement-only" ] && [ "$MODE" != "context-only" ] && [ -z "$TASK" ]; then
+if [ "$CHOOSE_MODELS" -eq 0 ] \
+    && [ "$MODE" != "implement-only" ] && [ "$MODE" != "context-only" ] && [ -z "$TASK" ]; then
     die "No task supplied. Example: ./agent-flow.sh \"Add authentication\""
+fi
+if [ "$CHOOSE_MODELS" -eq 1 ] && [ -n "$TASK" ]; then
+    warn "A task was given together with --models; ignoring the task text."
 fi
 if [ "$MODE" = "implement-only" ] && [ -n "$TASK" ]; then
     warn "A task was given together with --implement-only; ignoring the task text."
@@ -2788,6 +3161,24 @@ fi
 setup_workflow
 acquire_lock
 prune_history
+
+load_models_conf || true
+if [ "$CHOOSE_MODELS" -eq 1 ]; then
+    if ! configure_models; then
+        printf '\n'
+        warn "Model selection cancelled; nothing was changed."
+        exit 0
+    fi
+    success "Models saved to ${MODELS_CONF#"$ROOT"/}."
+    printf '\n%sPrompt Engineer: %s%s\n%sCoding Agent:    %s%s\n%sContext Builder: %s%s\n' \
+        "$C_BOLD" "$(describe_model "$SAVED_PE_MODEL")" "$C_OFF" \
+        "$C_BOLD" "$(describe_model "$SAVED_CODER_MODEL")" "$C_OFF" \
+        "$C_BOLD" "$(describe_model "$SAVED_CONTEXT_MODEL")" "$C_OFF"
+    exit 0
+fi
+maybe_offer_models
+resolve_models
+print_models_line
 
 EXIT_CODE=0
 
