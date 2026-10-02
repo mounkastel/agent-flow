@@ -145,9 +145,16 @@ wins, and `bash` matches the *parsed command* (`git status --porcelain`).
 
 "Read-only shell" here is deliberate: an agent that cannot run `git log` or `ls` does not
 fail — it rebuilds git state by reading `.git/HEAD` and `.git/config` as text, which costs
-many times more calls for strictly less information. `agent-flow --doctor` reports an agent
-whose permission block allows no shell at all, so the failure mode is visible rather than
-silent.
+many times more calls for strictly less information. So an agent whose permission block
+allows no shell at all is treated as a **stop**, not a warning: the run is refused before
+any agent starts, before a branch is created, with the command to fix it.
+
+```sh
+agent-flow --setup --force    # refresh the installed agent definitions
+```
+
+Agent definitions are installed per repository, so a checkout created before an upgrade
+needs the same command. `--doctor` reports the same thing without refusing to run.
 
 ## Tests
 

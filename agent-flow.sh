@@ -2012,13 +2012,13 @@ install_agent_file() {
 # Cheap static sanity check of our own templates. A legacy V1 `permission:` block
 # is silently ignored by OpenCode V2, which would leave the agents unrestricted.
 check_agent_templates() {
-    local f label missing=0
+    local f label missing=0 noshell=0
     for f in "$PROMPT_ENGINEER_FILE" "$CODING_AGENT_FILE" "$CONTEXT_BUILDER_FILE"; do
         label="${f##*/}"
         label="${label%.md}"
         [ -f "$f" ] || continue
         if grep -Eq '^permission:' "$f"; then
-            error "$label uses the legacy V1 'permission:' block; OpenCode V2 ignores it. Fix with --setup --force."
+            error "$label uses the legacy V1 'permission:' block; OpenCode V2 ignores it, and the agent then runs with permissive defaults. Fix with --setup --force."
             missing=1
         fi
         if ! grep -Eq '^permissions:' "$f"; then
@@ -2029,23 +2029,36 @@ check_agent_templates() {
     # The two research agents start from `action: "*" -> deny`. If nothing ever
     # allows `bash`, they cannot run `git log` or `ls`, and they do not fail --
     # they quietly rebuild git state by reading .git/HEAD as text, which costs
-    # many times more calls for less information. It is worth failing loudly.
+    # many times more calls for less information. Running anyway just burns
+    # tokens on a result we already know will be poor.
     for f in "$PROMPT_ENGINEER_FILE" "$CONTEXT_BUILDER_FILE"; do
         [ -f "$f" ] || continue
-        label="${f##*/}"
-        if ! awk '
-            /^permissions:/ { inblock = 1; next }
-            inblock && /^---[[:space:]]*$/ { exit }
-            inblock && /action:[[:space:]]*"?bash"?/ { inbash = 1; next }
-            inblock && /action:/ { inbash = 0 }
-            inblock && inbash && /effect:[[:space:]]*"?allow"?/ { found = 1 }
-            END { exit(found ? 0 : 1) }
-        ' "$f" 2>/dev/null; then
-            error "$label allows no shell command: it cannot run git log, ls or grep, and will reconstruct repository state by reading files such as .git/HEAD. Fix with --setup --force."
-            missing=1
+        if ! agent_allows_shell "$f"; then
+            noshell=1
+            error "${f##*/} allows no shell command: it cannot run git log, ls or grep, and will reconstruct repository state by reading files such as .git/HEAD."
         fi
     done
+    if [ "$noshell" -eq 1 ]; then
+        printf '\n'
+        error "This run would waste tokens: the agents above cannot inspect the repository."
+        printf '  Refresh the agent definitions once:\n\n'
+        printf '      %s --setup --force\n\n' "$SELF_NAME"
+        printf '  They are installed per repository, so an older copy in another\n'
+        printf '  checkout needs the same command.\n'
+        return 1
+    fi
     return "$missing"
+}
+
+agent_allows_shell() { # agent_allows_shell FILE -> 0 if any bash rule allows
+    awk '
+        /^permissions:/ { inblock = 1; next }
+        inblock && /^---[[:space:]]*$/ { exit }
+        inblock && /action:[[:space:]]*"?bash"?/ { inbash = 1; next }
+        inblock && /action:/ { inbash = 0 }
+        inblock && inbash && /effect:[[:space:]]*"?allow"?/ { found = 1 }
+        END { exit(found ? 0 : 1) }
+    ' "$1" 2>/dev/null
 }
 
 # Keep the workflow out of git WITHOUT touching any tracked file:
@@ -3061,7 +3074,12 @@ setup_workflow() {
     install_agent_file "$PROMPT_ENGINEER_FILE" write_prompt_engineer "Prompt Engineer"
     install_agent_file "$CODING_AGENT_FILE"    write_coding_agent    "Coding Agent"
     install_agent_file "$CONTEXT_BUILDER_FILE" write_context_builder "Context Builder"
-    check_agent_templates || true
+    # Not swallowed with `|| true`: an agent whose permissions are known to wreck
+    # the run is a reason to stop before spending anything on it, not a warning
+    # to scroll past. The lock is not held yet, so exiting here is clean.
+    if ! check_agent_templates; then
+        exit 1
+    fi
 
     if [ ! -f "$WORKFLOW_DIR/README.md" ] || [ "$FORCE" -eq 1 ]; then
         write_readme
