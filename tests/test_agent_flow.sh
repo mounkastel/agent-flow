@@ -414,6 +414,60 @@ assert_file_contains() { # LABEL FILE NEEDLE
     fi
 }
 
+assert_contains_near() { # LABEL FILE FIRST SECOND (within 3 lines)
+    if grep -A3 -F -- "$2" "$1" 2>/dev/null | grep -Fq -- "$3"; then
+        ok "$1"
+    else
+        bad "$1" "expected $3 within 3 lines of $2" ""
+    fi
+}
+
+agent_rule() { # agent_rule FILE ACTION RESOURCE -> allow|deny|missing
+    # Last matching rule wins, wildcards are `*` and `?`, exactly as opencode
+    # resolves them. Anything unmatched falls through to the base deny.
+    awk -v act="$2" -v res="$3" '
+        /^permissions:/ { inblock = 1; next }
+        inblock && /^---[[:space:]]*$/ { exit }
+        inblock && $0 ~ /action:/ {
+            cur = $0
+            sub(/^[^:]*:[[:space:]]*/, "", cur)
+            gsub(/"/, "", cur)
+            ca = cur
+            next
+        }
+        inblock && $0 ~ /resource:/ {
+            cur = $0
+            sub(/^[^:]*:[[:space:]]*/, "", cur)
+            gsub(/"/, "", cur)
+            cr = cur
+            next
+        }
+        inblock && $0 ~ /effect:/ {
+            cur = $0
+            sub(/^[^:]*:[[:space:]]*/, "", cur)
+            gsub(/"/, "", cur)
+            if ((ca == act || ca == "*") && matchres(cr, res)) ce = cur
+        }
+        # Only real regexp metacharacters may be backslash-escaped: escaping a
+        # plain letter produces an unknown escape and silently never matches.
+        function matchres(pat, s,   o, i, c) {
+            o = "^"
+            for (i = 1; i <= length(pat); i++) {
+                c = substr(pat, i, 1)
+                if (c == "*") o = o ".*"
+                else if (c == "?") o = o "."
+                else if (index("[]\\^$.|(){}+/", c) > 0) o = o "\\" c
+                else o = o c
+            }
+            return s ~ (o "$")
+        }
+        END {
+            if (ce == "") print "deny"
+            else print ce
+        }
+    ' "$1" 2>/dev/null
+}
+
 assert_not_contains() { # LABEL HAYSTACK NEEDLE
     case "$2" in
         *"$3"*) bad "$1" "expected NOT to contain: $3" "actual: ${2:0:400}" ;;
@@ -1333,9 +1387,13 @@ if should_run "agents/definitions"; then
     assert_contains "PE contract mentions DRAFT WRITTEN" "$(cat "$pe")" "DRAFT WRITTEN"
     assert_contains "CB contract mentions CONTEXT WRITTEN" "$(cat "$cb")" "CONTEXT WRITTEN"
     assert_contains "CA contract lists the result words" "$(cat "$ca")" "COMPLETED | PARTIALLY_COMPLETED | BLOCKED | FAILED"
-    assert_contains "template marker is present (pe)" "$(cat "$pe")" "agent-flow-template: v4"
-    assert_contains "template marker is present (ca)" "$(cat "$ca")" "agent-flow-template: v4"
-    assert_contains "template marker is present (cb)" "$(cat "$cb")" "agent-flow-template: v4"
+    # The version is stamped from TEMPLATE_VERSION after the heredoc is written,
+    # so it must match whatever the runner currently declares -- not a literal.
+    want_version="$(sed -n 's/^TEMPLATE_VERSION="\(.*\)"$/\1/p' "$SCRIPT" | head -n 1)"
+    assert_ne "the runner declares a template version" "" "$want_version"
+    assert_contains "template marker is present (pe)" "$(cat "$pe")" "agent-flow-template: $want_version"
+    assert_contains "template marker is present (ca)" "$(cat "$ca")" "agent-flow-template: $want_version"
+    assert_contains "template marker is present (cb)" "$(cat "$cb")" "agent-flow-template: $want_version"
 
     # Every permission rule must be a complete 3-key object.
     incomplete="$(awk '/^permissions:/{f=1;next} /^---$/{f=0} f && /^  - action:/ {want=2; have=0} f && /resource:|effect:/ {have++} f && have==want {have=0} END{print have+0}' "$ca")"
@@ -2206,6 +2264,124 @@ if should_run "ux/timeout-no-orphan"; then
         assert_eq "no watchdog process is left behind" "$before" \
             "$(pgrep -c -f 'sleep 3600' 2>/dev/null || echo 0)"
     fi
+fi
+
+if should_run "agents/read-only-shell"; then
+    t "the research agents get a read-only shell instead of none at all"
+    # Found in a real run: with `action: "*" -> deny` and nothing re-allowing
+    # `bash`, the Context Builder and Prompt Engineer could not run `git log`
+    # or `ls`. They did not fail -- they rebuilt git state by reading .git/HEAD
+    # and .git/config as text, spending many times more calls for less.
+    repo="$(make_repo agents-shell)"
+    export MOCK_CB=good MOCK_PE=good
+    want_version="$(sed -n 's/^TEMPLATE_VERSION="\(.*\)"$/\1/p' "$SCRIPT" | head -n 1)"
+    flow "$repo" --setup
+    assert_eq "setup succeeds" 0 "$RUN_RC"
+
+    for a in prompt-engineer context-builder; do
+        f="$repo/.opencode/agents/$a.md"
+        assert_file "$a exists" "$f"
+        assert_file_line "$f" '    resource: "git *"'
+        assert_contains_near "$f" 'action: "bash"' 'effect: allow'
+        # Writing git commands and destructive shell commands stay denied.
+        for pat in 'git commit*' 'git push*' 'git add*' 'rm*' 'chmod*' 'curl*' 'sudo*'; do
+            assert_file_line "$f" "    resource: \"$pat\""
+        done
+        # And the agent may still write only its own draft.
+        assert_eq "$a may not edit the project" deny \
+            "$(agent_rule "$f" edit README.md)"
+    done
+
+    # Exactly one file is writable per research agent.
+    assert_eq "context-builder may write its draft" allow \
+        "$(agent_rule "$repo/.opencode/agents/context-builder.md" edit .agent/context/PROJECT.draft.md)"
+    assert_eq "context-builder may not write the prompt" deny \
+        "$(agent_rule "$repo/.opencode/agents/context-builder.md" edit .agent/prompts/latest.md)"
+    assert_eq "prompt-engineer may write its draft" allow \
+        "$(agent_rule "$repo/.opencode/agents/prompt-engineer.md" edit .agent/prompts/draft.md)"
+    assert_eq "prompt-engineer may not write the context" deny \
+        "$(agent_rule "$repo/.opencode/agents/prompt-engineer.md" edit .agent/context/PROJECT.md)"
+
+    # The coding agent is deliberately unrestricted, but its history/privilege
+    # denials are not optional: they used to be written against `action:
+    # "shell"`, which is not an action in OpenCode V2, so all ~100 of them were
+    # inert and nothing stopped the agent from committing, pushing or `sudo`.
+    ca="$repo/.opencode/agents/coding-agent.md"
+    assert_eq "coding agent still runs git" allow "$(agent_rule "$ca" bash "git status --short")"
+    assert_eq "coding agent still runs tests" allow "$(agent_rule "$ca" bash "npm test")"
+    assert_eq "coding agent still edits files" allow "$(agent_rule "$ca" edit README.md)"
+    for c in "git commit" "git commit -m x" "git push" "git push --force" \
+             "git reset --hard" "git rebase" "git merge main" "sudo rm x" "chmod +x f"; do
+        assert_eq "coding agent is denied: $c" deny "$(agent_rule "$ca" bash "$c")"
+    done
+    assert_eq "and the prompt stays untouched" deny \
+        "$(agent_rule "$ca" edit .agent/prompts/latest.md)"
+
+    # The template version moved, so an existing v4 install is reported stale
+    # rather than silently kept -- and --force is what clears it.
+    sed -i.bak "s|agent-flow-template: ${want_version}|agent-flow-template: v0|" \
+        "$repo/.opencode/agents/context-builder.md"
+    rm -f "$repo/.opencode/agents/context-builder.md.bak"
+    flow "$repo" --doctor
+    assert_contains "a v4-era agent is reported outdated" "$RUN_OUT" "outdated"
+    flow "$repo" --setup --force >/dev/null 2>&1
+    flow "$repo" --doctor
+    assert_not_contains "and fresh once installed with --force" "$RUN_OUT" "outdated"
+
+    # The marker has to be stamped from TEMPLATE_VERSION, not hardcoded: when it
+    # was a literal inside the quoted heredoc, every install looked outdated
+    # forever and --setup --force could never clear it.
+    flow "$repo" --setup --force >/dev/null 2>&1
+    assert_file_contains "$repo/.opencode/agents/context-builder.md" \
+        "agent-flow-template: $want_version"
+fi
+
+if should_run "agents/no-shell-detected"; then
+    t "an agent stripped of its shell is reported, not silently kept"
+    repo="$(make_repo agents-noshell)"
+    export MOCK_CB=good
+    flow "$repo" --setup >/dev/null 2>&1
+    cat > "$repo/.opencode/agents/context-builder.md" <<'EOF'
+---
+description: legacy, no shell at all
+mode: primary
+permissions:
+  - action: "*"
+    resource: "*"
+    effect: deny
+---
+body
+EOF
+    flow "$repo" --setup
+    assert_contains "the missing shell is called out" "$RUN_OUT" "allows no shell"
+    assert_contains "with what it costs" "$RUN_OUT" ".git/HEAD"
+    assert_contains "and how to fix it" "$RUN_OUT" "--setup --force"
+    assert_not_contains "and the current agent is left alone" "$RUN_OUT" \
+        "prompt-engineer.md allows no shell"
+    flow "$repo" --setup --force
+    flow "$repo" --setup
+    assert_not_contains "a correct agent is not accused" "$RUN_OUT" "allows no shell"
+fi
+
+if should_run "agents/workflow-readme"; then
+    t "the .agent README does not send agents hunting for absent files"
+    repo="$(make_repo agents-readme)"
+    export MOCK_CB=good
+    flow "$repo" --setup >/dev/null 2>&1
+    readme="$repo/.agent/README.md"
+    assert_file "the README exists" "$readme"
+    readme_text="$(cat "$readme")"
+    assert_contains "it says it is not about this project" "$readme_text" \
+        "not your project"
+    assert_contains "and warns against following its paths" "$readme_text" \
+        "must not go looking"
+    # The confusing bits: a reference to a test suite and a script path that do
+    # not exist in the user's repository.
+    assert_not_contains "no claim that a test suite lives here" "$readme_text" \
+        "tests/test_agent_flow.sh"
+    assert_not_contains "no ./agent-flow.sh invocation" "$readme_text" "./agent-flow.sh"
+    assert_contains "the run records are documented" "$readme_text" ".agent/runs/"
+    assert_contains "and the read-only shell rule" "$readme_text" "read-only shell"
 fi
 
 # ------------------------------------------------------------------------------

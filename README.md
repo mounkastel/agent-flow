@@ -132,6 +132,23 @@ before and after each of them and aborts if anything changed. Outside a git repo
 fingerprint is built from file metadata (path, size, mtime, ctime, inode, mode) — as
 sensitive as git's own index, but it never reads file contents.
 
+### What the agents are allowed
+
+OpenCode V2 decides permissions from ordered `action`/`resource`/`effect` rules, last match
+wins, and `bash` matches the *parsed command* (`git status --porcelain`).
+
+| Agent | shell | writes | cannot |
+|---|---|---|---|
+| `context-builder` | read-only, plus `make`/`npm test`/`bash -n`/`cargo check` | its own `PROJECT.draft.md` | `git commit`, `rm`, `chmod`, `curl`, `sudo` |
+| `prompt-engineer` | same | its own `draft.md` | same |
+| `coding-agent` | everything but history rewriting and privilege | the repository | `git commit`, `git push`, `git reset`, `sudo`, `curl \| sh`, editing the prompt |
+
+"Read-only shell" here is deliberate: an agent that cannot run `git log` or `ls` does not
+fail — it rebuilds git state by reading `.git/HEAD` and `.git/config` as text, which costs
+many times more calls for strictly less information. `agent-flow --doctor` reports an agent
+whose permission block allows no shell at all, so the failure mode is visible rather than
+silent.
+
 ## Tests
 
 ```sh
