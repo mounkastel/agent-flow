@@ -128,9 +128,7 @@ mode_var="MOCK_PE"
 [ "$agent" = "coding-agent" ] && mode_var="MOCK_CA"
 mode="${!mode_var:-good}"
 
-write_context() {
-    mkdir -p .agent/context
-    cat > .agent/context/PROJECT.draft.md <<'EOF'
+CONTEXT_BODY="$(cat <<'EOF'
 # Overview
 A tiny fixture project used by the agent-flow test suite. Project type: CLI.
 
@@ -157,6 +155,19 @@ Shell-based assertions, PASS/FAIL log.
 # Pitfalls
 Nothing to see here.
 EOF
+)"
+
+# write_context [FILE]  -- default destination is the draft file; "-" means
+# "print to stdout instead", which is how an agent that could not write its
+# draft behaves.
+write_context() {
+    local dest="${1:-.agent/context/PROJECT.draft.md}"
+    if [ "$dest" = "-" ]; then
+        printf '%s\n' "$CONTEXT_BODY"
+        return 0
+    fi
+    mkdir -p "$(dirname "$dest")"
+    printf '%s\n' "$CONTEXT_BODY" > "$dest"
 }
 
 write_prompt() {
@@ -171,6 +182,9 @@ Add a greeting to the fixture CLI.
 
 # Current State
 The greeting is missing.
+
+# Assumptions
+- "greeting" means a single line on stdout.
 
 # Requirements
 1. Print a greeting when run.
@@ -237,6 +251,7 @@ context-builder)
         partial) write_context; printf '# Overview\nonly this\n' > .agent/context/PROJECT.draft.md
                  emit_marker "CONTEXT WRITTEN"; exit 0 ;;
         missing) emit_marker "CONTEXT WRITTEN"; exit 0 ;;
+        message) write_context -; exit 0 ;;
         modify)  write_context; printf 'stray\n' > stray-file.txt
                  emit_marker "CONTEXT WRITTEN"; exit 0 ;;
         slow)    sleep 30; exit 0 ;;
@@ -1056,7 +1071,15 @@ if should_run "lock/signals"; then
             [ -f "$repo/.agent/runtime/lock/pid" ] && break
             sleep 0.1
         done
-        children="$(pgrep -P "$victim" 2>/dev/null || true)"
+        # The lock file appears in acquire_lock, which runs BEFORE the agent is
+        # forked, so a single immediate pgrep lost that race every time. Poll for
+        # the agent process instead.
+        children=""
+        for _ in $(seq 1 100); do
+            children="$(pgrep -P "$victim" 2>/dev/null || true)"
+            [ -n "$children" ] && break
+            sleep 0.1
+        done
         if [ -n "$children" ]; then
             ok "SIG$sig case has a live agent process"
         else
@@ -1352,6 +1375,182 @@ if should_run "meta/hostile-input"; then
         assert_no_file "no pwned2 file from: $(printf '%s' "$nasty" | head -c 24)" "$repo/pwned2"
     done
     assert_file "repository is intact" "$repo/README.md"
+fi
+
+# ==============================================================================
+# 12. Regression tests for bugs fixed after the initial release
+# ==============================================================================
+
+if should_run "fix/heredoc-delimiter"; then
+    t "the Prompt Engineer instruction carries no dead heredoc delimiter"
+    repo="$(make_repo heredoc)"
+    mock_log heredoc
+    export MOCK_CB=good MOCK_PE=good
+    flow "$repo" --prompt-only 'Ship EOF and $(id -un) and ${HOME} and $delim'
+    assert_eq "prompt-only run exits 0" 0 "$RUN_RC"
+    log="$(cat "$MOCK_LOG")"
+    # The instruction used to embed the *unexpanded* heredoc source, so the
+    # delimiter variable leaked into the prompt as literal text.
+    assert_not_contains "instruction has no leftover delimiter" "$log" "AGENT_FLOW_HEREDOC"
+    assert_contains "task text is passed through verbatim" "$log" '$(id -un)'
+    assert_contains "task text keeps ${HOME} unexpanded" "$log" '${HOME}'
+    assert_no_file "nothing was executed from the task" "$repo/pwned"
+fi
+
+if should_run "fix/cyrillic-slug"; then
+    t "non-Latin task text produces a usable branch name"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=completed
+
+    repo="$(make_repo cyrillic)"
+    flow "$repo" "Исправить валидацию токена"
+    br="$(branch_of "$repo")"
+    case "$br" in
+        agent/ispravit-validatsiyu-tokena-*)
+            ok "Cyrillic is transliterated: $br" ;;
+        *)
+            bad "Cyrillic is transliterated" "got: $br" ;;
+    esac
+
+    # A script with no transliteration table (Chinese) used to slugify to an
+    # empty string. It must fall back to a stable hash slug instead.
+    repo2="$(make_repo cjk)"
+    flow "$repo2" "修复令牌验证"
+    br2="$(branch_of "$repo2")"
+    case "${br2%-20*}" in
+        agent/task-[0-9]*)
+            ok "non-Latin task falls back to a hash slug: $br2" ;;
+        *)
+            bad "non-Latin task falls back to a hash slug" "got: $br2" ;;
+    esac
+
+    repo3="$(make_repo cjk2)"
+    flow "$repo3" "修复令牌验证"
+    br3="$(branch_of "$repo3")"
+    assert_eq "the same task yields the same hash slug" "${br2%-20*}" "${br3%-20*}"
+    br4="$br3"
+    case "$br4" in
+        agent/-*|agent/) bad "slug is never empty" "got: $br4" ;;
+        *) ok "slug is never empty" ;;
+    esac
+fi
+
+if should_run "fix/context-stdout"; then
+    t "a briefing printed to stdout instead of the draft file is still used"
+    repo="$(make_repo ctx-stdout)"
+    export MOCK_CB=message MOCK_PE=good
+    flow "$repo" --context-only
+    assert_eq "context-only run with a stdout briefing exits 0" 0 "$RUN_RC"
+    assert_contains "the fallback is announced" "$RUN_OUT" "falling back to the agent's final message"
+    assert_file "project context exists" "$repo/.agent/context/PROJECT.md"
+    assert_contains "context came from the stdout fallback" "$(cat "$repo/.agent/context/PROJECT.md")" "Overview"
+    unset MOCK_CB
+fi
+
+if should_run "fix/nogit-readonly"; then
+    t "outside git, a read-only agent that writes is still caught"
+    plain="$SANDBOX/plain-modify"
+    mkdir -p "$plain"
+    printf 'x\n' > "$plain/file.txt"
+    export MOCK_CB=modify MOCK_PE=good
+    flow "$plain" --prompt-only "task outside git"
+    assert_eq "the write is detected without git" 1 "$RUN_RC"
+    assert_contains "the guard explains there is no git" "$RUN_OUT" "Not a git repository"
+    assert_no_file "the draft was not promoted" "$plain/.agent/prompts/latest.md"
+
+    # Positive control: the fingerprint must be stable across runs, so an
+    # unchanged tree is never reported as modified.
+    plain2="$SANDBOX/plain-stable"
+    mkdir -p "$plain2"
+    printf 'x\n' > "$plain2/file.txt"
+    export MOCK_CB=good
+    flow "$plain2" --prompt-only "first"
+    first_rc="$RUN_RC"
+    flow "$plain2" --prompt-only "second"
+    assert_eq "an unchanged non-git tree is not flagged (run 1)" 0 "$first_rc"
+    assert_eq "an unchanged non-git tree is not flagged (run 2)" 0 "$RUN_RC"
+    unset MOCK_CB
+fi
+
+if should_run "fix/report-bold-heading"; then
+    t "a bolded heading-and-value line still parses as the result"
+    repo="$(make_repo bold-report)"
+    export MOCK_CB=good MOCK_PE=good
+    flow "$repo" --prompt-only "seed the prompt"
+    assert_eq "seed prompt run exits 0" 0 "$RUN_RC"
+    body="$SANDBOX/bold-body.md"
+    # `# **Result**: **COMPLETED**` used to yield an empty result, so a
+    # successful run exited 3 ("no report") instead of 0.
+    printf '# Task\nx\n\n# **Result**: **COMPLETED**\n\n# Summary\nx\n' > "$body"
+    export MOCK_CA=completed MOCK_REPORT_FILE="$body"
+    flow "$repo" --implement-only
+    assert_eq "bolded inline result exits 0" 0 "$RUN_RC"
+    unset MOCK_REPORT_FILE
+fi
+
+if should_run "fix/implement-only-no-prompt"; then
+    t "--implement-only without a prompt fails before creating a branch"
+    repo="$(make_repo impl-noprompt)"
+    before="$(branch_of "$repo")"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=completed
+    flow "$repo" --implement-only
+    assert_eq "run exits 1" 1 "$RUN_RC"
+    assert_contains "the missing prompt is explained" "$RUN_OUT" "No prompt found"
+    assert_eq "no branch was created" "$before" "$(branch_of "$repo")"
+fi
+
+if should_run "fix/base-branch"; then
+    t "switching to an existing branch does not claim to have created it"
+    repo="$(make_repo basebranch)"
+    git -C "$repo" branch existing-work >/dev/null 2>&1
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=completed
+    flow "$repo" --branch existing-work "task on an existing branch"
+    assert_eq "run exits 0" 0 "$RUN_RC"
+    assert_eq "stayed on the existing branch" "existing-work" "$(branch_of "$repo")"
+    assert_contains "the switch is reported" "$RUN_OUT" "Switched to existing branch"
+    # The "(created from ...)" hint lives in the console summary, not in the
+    # report file; an existing branch must not get a creation claim.
+    assert_contains "the summary names the branch" "$RUN_OUT" "existing-work"
+    assert_not_contains "the summary does not claim creation" "$RUN_OUT" "created from"
+fi
+
+if should_run "fix/lock-owner-guard"; then
+    t "a run does not delete a lock that a new owner has taken over"
+    repo="$(make_repo lock-owner)"
+    export MOCK_CB=good MOCK_SLEEP=4
+    ( cd "$repo" && exec bash "$SCRIPT" --context-only >/dev/null 2>&1 ) &
+    victim=$!
+    for _ in $(seq 1 100); do
+        [ -f "$repo/.agent/runtime/lock/pid" ] && break
+        sleep 0.1
+    done
+    # Simulate a stale-lock reclaim by another run while we are still working:
+    # the pid file now belongs to somebody else.
+    sleep 30 &
+    other=$!
+    printf '%s\n' "$other" > "$repo/.agent/runtime/lock/pid"
+    wait "$victim" 2>/dev/null
+    if [ -f "$repo/.agent/runtime/lock/pid" ]; then
+        assert_eq "the new owner's pid file survives" "$other" "$(cat "$repo/.agent/runtime/lock/pid")"
+    else
+        bad "the new owner's pid file survives" "the lock directory was deleted by a run that no longer owned it"
+    fi
+    kill "$other" 2>/dev/null
+    wait "$other" 2>/dev/null
+    rm -rf "$repo/.agent/runtime/lock"
+    unset MOCK_SLEEP
+fi
+
+if should_run "fix/prune-collision"; then
+    t "retention keeps the newer file when two archives share a timestamp"
+    repo="$(make_repo prune-collide)"
+    flow "$repo" --setup >/dev/null 2>&1
+    h="$repo/.agent/prompts/history"
+    mkdir -p "$h"
+    printf 'base\n' > "$h/20240101-000000.md"
+    printf 'second\n' > "$h/20240101-000000-2.md"
+    flow "$repo" --keep 1 --context-only
+    assert_file "the collision-suffixed archive survives" "$h/20240101-000000-2.md"
+    assert_no_file "the base archive is pruned" "$h/20240101-000000.md"
 fi
 
 # ------------------------------------------------------------------------------
