@@ -574,7 +574,7 @@ flow() { # flow REPO [args...]   (env: MOCK_* control the mock)
     RUN_OUT="$(cd "$repo" && bash "$SCRIPT" "$@" 2>&1)"
     RUN_RC=$?
     if [ "$VERBOSE" = "1" ]; then
-        printf '--- exit=%s cmd=agent-flow.sh %s\n%s\n' "$RUN_RC" "$*" "$RUN_OUT" >&2
+        printf -- '--- exit=%s cmd=agent-flow.sh %s\n%s\n' "$RUN_RC" "$*" "$RUN_OUT" >&2
     fi
     return 0
 }
@@ -3126,6 +3126,35 @@ if should_run "ux/run-order"; then
     # The order, not just the presence: the middle run must not lead.
     first="$(printf '%s\n' "$RUN_OUT" | grep -oE 'прогон [0-9]' | head -1)"
     assert_eq "and nothing older comes first" "прогон 3" "$first"
+fi
+
+if should_run "pr/reused-branch"; then
+    t "--pr works when the run reused an existing agent branch"
+    repo="$(make_repo pr-reused)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-reused.log" GH_PR_BODY="$SANDBOX/gh-reused.md"
+    : > "$GH_PR_LOG"
+
+    # A first run creates the branch, a second one reuses it. On the second run
+    # the branch tracks origin/<same branch>, so resolving the base from the
+    # upstream returns the branch itself -- which used to be refused outright
+    # as "the PR base is the branch itself", leaving the work unpushable with no
+    # way out except --pr-base.
+    flow "$repo" --pr --yes "первая задача"
+    branch="$(branch_of "$repo")"
+    # The mock writes the same content every time, so the second run needs a
+    # real change to publish or it would stop at "Nothing changed".
+    printf 'second task\n' > "$repo/second.txt"
+    : > "$GH_PR_LOG"
+    flow "$repo" --pr --yes "вторая задача"
+
+    assert_eq "the second run publishes" 0 "$RUN_RC"
+    assert_contains "the PR targets the base, not the branch" \
+        "$(pr_log)" "pr create --base main"
+    assert_contains "and names the reused branch" "$(pr_log)" "--head $branch"
+    assert_not_contains "no complaint about the base being itself" \
+        "$RUN_OUT" "base is the branch itself"
 fi
 
 # ------------------------------------------------------------------------------
