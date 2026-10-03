@@ -314,6 +314,7 @@ coding-agent)
         completed) write_report COMPLETED; exit 0 ;;
         partial)   write_report PARTIALLY_COMPLETED; exit 0 ;;
         blocked)   write_report BLOCKED; exit 0 ;;
+        blocked-modify) write_report BLOCKED; printf 'half\n' > partial.txt; exit 0 ;;
         failed)    write_report FAILED; exit 0 ;;
         noreport)  printf 'I am done.\n'; exit 0 ;;
         modify)    write_report COMPLETED; printf 'stray\n' > stray-file.txt; exit 0 ;;
@@ -335,6 +336,34 @@ coding-agent)
 esac
 MOCK
 chmod +x "$MOCK_BIN/opencode"
+
+# gh mock. Every invocation lands in $GH_PR_LOG so a test can read back exactly
+# what the runner asked the forge to do, including the things it must not do.
+cat > "$MOCK_BIN/gh" <<'GHMOCK'
+#!/usr/bin/env bash
+printf '%s\n' "gh $*" >> "${GH_PR_LOG:-/dev/null}"
+case "${GH_AUTH:-ok}" in
+    fail) printf 'not logged in\n' >&2; exit 1 ;;
+esac
+case "$1 $2" in
+    "auth status")  exit 0 ;;
+    "pr list")      printf '%s\n' "${GH_PR_EXISTING:-}" ;;
+    "pr create")
+        # Remember the body so a test can look at the title and the notes.
+        prev="" cur=""
+        for a in "$@"; do
+            if [ "$prev" = "--body-file" ]; then cur="$a"; fi
+            prev="$a"
+        done
+        [ -n "$cur" ] && [ -f "$cur" ] && cp "$cur" "${GH_PR_BODY:-/dev/null}"
+        printf 'https://github.com/octo/fork/pull/42\n'
+        ;;
+    "pr view")      printf 'https://github.com/octo/fork/pull/42\n' ;;
+    "pr edit")      exit 0 ;;
+esac
+exit 0
+GHMOCK
+chmod +x "$MOCK_BIN/gh"
 
 export PATH="$MOCK_BIN:$PATH"
 
@@ -551,6 +580,58 @@ flow() { # flow REPO [args...]   (env: MOCK_* control the mock)
 }
 
 branch_of() { git -C "$1" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "detached"; }
+
+flow_in() { # flow_in INPUT REPO [args...] -- like flow, but with stdin
+    local input="$1" repo="$2"; shift 2
+    RUN_OUT="$(cd "$repo" && printf '%s\n' "$input" | bash "$SCRIPT" "$@" 2>&1)"
+    RUN_RC=$?
+    if [ "$VERBOSE" = "1" ]; then
+        printf '--- exit=%s cmd=agent-flow.sh %s\n%s\n' "$RUN_RC" "$*" "$RUN_OUT" >&2
+    fi
+    return 0
+}
+
+with_origin() { # with_origin REPO -- a real bare origin, and main as the base
+    local repo="$1" bare="$SANDBOX/origin-$REPO_SEED.git"
+    # Pin the branch name. git's default here would otherwise be whatever
+    # init.defaultBranch says, and the base branch is what --pr targets.
+    git -C "$repo" branch -q -M main >/dev/null 2>&1 || true
+    rm -rf "$bare"
+    git init -q --bare "$bare"
+    git -C "$repo" remote remove origin >/dev/null 2>&1 || true
+    git -C "$repo" remote add origin "$bare"
+    git -C "$repo" push -q origin main >/dev/null 2>&1 || true
+}
+
+pushed_refs() { # pushed_refs REPO -> the refs the bare origin actually has
+    local repo="$1" url
+    url="$(git -C "$repo" remote get-url origin 2>/dev/null || true)"
+    [ -n "$url" ] || return 0
+    git -C "$url" for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null || true
+}
+
+pr_log() { cat "$GH_PR_LOG" 2>/dev/null || true; }
+
+mask_bin() { # mask_bin NAME -> a PATH directory in which NAME cannot be found
+    # Linking everything else keeps bash, git and the opencode mock reachable
+    # while NAME becomes unreachable even when a working copy is installed
+    # system-wide.
+    local name="$1" dir="$SANDBOX/masked-$1" e f base
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    local IFS=:
+    for e in $PATH; do
+        [ -n "$e" ] || e=.
+        for f in "$e"/*; do
+            [ -f "$f" ] && [ -x "$f" ] || continue
+            base="${f##*/}"
+            [ "$base" = "$name" ] && continue
+            [ -e "$dir/$base" ] && continue
+            ln -sf "$f" "$dir/$base" 2>/dev/null || true
+        done
+    done
+    printf '%s' "$dir"
+}
 
 mock_log() { # mock_log [NAME] -> set MOCK_LOG to a fresh call log OUTSIDE any
     # repo, so the log itself never shows up as a working-tree change.
@@ -2543,6 +2624,357 @@ EOF
     flow "$repo" --setup --force >/dev/null 2>&1
     flow "$repo" --prompt-only "снова можно"
     assert_eq "and the run proceeds" 0 "$RUN_RC"
+fi
+
+# ------------------------------------------------------------------------------
+# Publishing: --pr
+#
+# --pr replaces the manual review loop (inspect, compare, switch, add, push,
+# delete the branch) with one step, so these tests are mostly about what it must
+# NOT do: never merge, never publish credentials, never publish the workflow's
+# own bookkeeping.
+# ------------------------------------------------------------------------------
+
+if should_run "pr/basic"; then
+    t "--pr commits, pushes and opens a pull request in one step"
+    repo="$(make_repo pr-basic)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-basic.log" GH_PR_BODY="$SANDBOX/gh-basic.md"
+    : > "$GH_PR_LOG"
+
+    flow "$repo" --pr --yes "добавить кнопку"
+
+    assert_eq "the run finished" 0 "$RUN_RC"
+    branch="$(branch_of "$repo")"
+    case "$branch" in
+        agent/*) ok "the agent branch is still checked out" ;;
+        *) bad "the agent branch is still checked out" "$branch" ;;
+    esac
+    assert_eq "exactly one commit on top of main" "1" \
+        "$(git -C "$repo" rev-list --count "main..$branch" 2>/dev/null || echo '?')"
+    assert_contains "the commit holds the agent's work" \
+        "$(git -C "$repo" show --name-only --format= "$branch")" "stray-file.txt"
+    assert_not_contains "the commit holds no workflow bookkeeping" \
+        "$(git -C "$repo" show --name-only --format= "$branch")" ".agent/"
+    assert_contains "the branch reached the remote" "$(pushed_refs "$repo")" "$branch"
+    assert_contains "the PR targets the branch the run branched from" \
+        "$(pr_log)" "pr create --base main --head $branch"
+    assert_not_contains "the PR is not a draft" "$(pr_log)" "--draft"
+    assert_contains "the PR URL is reported" "$RUN_OUT" "pull/42"
+    assert_contains "the PR body carries the run result" "$(cat "$GH_PR_BODY")" "Result:"
+    assert_contains "the run record carries the PR" \
+        "$(grep -rh pull_request "$repo/.agent/runs" 2>/dev/null || true)" "pull/42"
+    assert_eq "and the run was recorded once, not twice" "1" \
+        "$(find "$repo/.agent/runs" -name '*.meta' -type f 2>/dev/null | wc -l | tr -d ' ')"
+fi
+
+if should_run "pr/never-merge"; then
+    t "--pr never merges anything"
+    repo="$(make_repo pr-nomerge)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-nomerge.log" GH_PR_BODY="$SANDBOX/gh-nomerge.md"
+    : > "$GH_PR_LOG"
+
+    flow "$repo" --pr --yes "задача"
+    assert_eq "the run finished" 0 "$RUN_RC"
+
+    log="$(pr_log)"
+    assert_not_contains "gh is never asked to merge" "$log" "pr merge"
+    assert_not_contains "nor to enable auto-merge" "$log" "--auto-merge"
+    assert_not_contains "nor to squash" "$log" "--squash"
+    # main must be untouched: a merge would show up as a new commit there.
+    assert_eq "main did not move" "$(git -C "$repo" rev-parse main)" \
+        "$(git -C "$repo" rev-parse "origin/main")"
+    assert_contains "and the user is told to review and merge" "$RUN_OUT" "merge"
+fi
+
+if should_run "pr/secrets"; then
+    t "--pr refuses to publish anything that looks like a credential"
+    repo="$(make_repo pr-secrets)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-secrets.log" GH_PR_BODY="$SANDBOX/gh-secrets.md"
+    : > "$GH_PR_LOG"
+    printf 'TOKEN=not-really\n' > "$repo/.env"
+    printf 'not-really\n' > "$repo/deploy.pem"
+
+    flow "$repo" --pr --yes "задача с секретами"
+
+    assert_ne "the publish is refused" 0 "$RUN_RC"
+    assert_contains "and the run reports failure" "$RUN_OUT" "look like credentials"
+    assert_contains "and names the file" "$RUN_OUT" ".env"
+    assert_contains "and names the key too" "$RUN_OUT" "deploy.pem"
+    assert_eq "nothing was committed" "0" \
+        "$(git -C "$repo" rev-list --count "main..$(branch_of "$repo")" 2>/dev/null || echo '?')"
+    assert_contains "no branch reached the remote" "$(pushed_refs "$repo")" "main"
+    assert_not_contains "and the agent branch is absent from the remote" \
+        "$(pushed_refs "$repo")" "agent/"
+    assert_not_contains "no PR was opened" "$(pr_log)" "pr create"
+fi
+
+if should_run "pr/bookkeeping"; then
+    t "--pr leaves agent-flow's own files out of the commit"
+    repo="$(make_repo pr-bookkeep)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-bookkeep.log" GH_PR_BODY="$SANDBOX/gh-bookkeep.md"
+    : > "$GH_PR_LOG"
+
+    # .git/info/exclude normally keeps the workflow's files out of `git add -A`,
+    # but exclude rules do not apply to files git already tracks. Repositories
+    # that committed .agent/reports/latest.md once would otherwise ship every
+    # new report inside the run's own commit.
+    flow "$repo" --setup --force >/dev/null 2>&1
+    mkdir -p "$repo/.agent/reports"
+    printf '# Result\n\nCOMPLETED\n\n(an old run)\n' > "$repo/.agent/reports/latest.md"
+    git -C "$repo" add -f .agent/reports/latest.md
+    git -C "$repo" commit -qm "track a report by hand"
+    git -C "$repo" push -q origin main
+
+    flow "$repo" --pr --yes "задача"
+
+    assert_eq "the publish still worked" 0 "$RUN_RC"
+    branch="$(branch_of "$repo")"
+    assert_not_contains "no bookkeeping in the commit" \
+        "$(git -C "$repo" show --name-only --format= "$branch")" ".agent/"
+    assert_contains "but the agent's work was" \
+        "$(git -C "$repo" show --name-only --format= "$branch")" "stray-file.txt"
+    assert_contains "and the user is told what was left out" "$RUN_OUT" "bookkeeping"
+    assert_contains "and how to stop it for good" "$RUN_OUT" "git rm -r --cached"
+fi
+
+if should_run "pr/draft"; then
+    t "a run that did not report COMPLETED is published as a draft"
+    repo="$(make_repo pr-draft)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=blocked-modify
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-draft.log" GH_PR_BODY="$SANDBOX/gh-draft.md"
+    : > "$GH_PR_LOG"
+
+    flow "$repo" --pr --yes "задача, которая заблокирована"
+
+    log="$(pr_log)"
+    assert_contains "the PR was opened" "$log" "pr create"
+    assert_contains "as a draft" "$log" "--draft"
+    assert_contains "with the result in the title" "$log" "[BLOCKED]"
+    assert_contains "and the reason is stated" "$RUN_OUT" "did not report COMPLETED"
+fi
+
+if should_run "pr/push-only"; then
+    t "--push-only commits and pushes but opens no pull request"
+    repo="$(make_repo pr-pushonly)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-pushonly.log" GH_PR_BODY="$SANDBOX/gh-pushonly.md"
+    : > "$GH_PR_LOG"
+
+    flow "$repo" --pr --push-only --yes "задача"
+
+    assert_eq "the run is reported as finished" 0 "$RUN_RC"
+    branch="$(branch_of "$repo")"
+    assert_contains "the branch reached the remote" "$(pushed_refs "$repo")" "$branch"
+    assert_not_contains "but no PR was opened" "$(pr_log)" "pr create"
+fi
+
+if should_run "pr/confirm"; then
+    t "--pr asks once, and only the word pr goes ahead"
+    repo="$(make_repo pr-confirm)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-confirm.log" GH_PR_BODY="$SANDBOX/gh-confirm.md"
+    : > "$GH_PR_LOG"
+
+    flow_in "yes" "$repo" --pr "задача"
+    assert_ne "anything but pr stops it" 0 "$RUN_RC"
+    assert_contains "and it says so" "$RUN_OUT" "Nothing was committed or pushed"
+    assert_eq "nothing was committed" "0" \
+        "$(git -C "$repo" rev-list --count "main..$(branch_of "$repo")" 2>/dev/null || echo '?')"
+    assert_not_contains "and no PR was opened" "$(pr_log)" "pr create"
+
+    repo2="$(make_repo pr-confirm-ok)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo2"
+    export GH_PR_LOG="$SANDBOX/gh-confirm2.log" GH_PR_BODY="$SANDBOX/gh-confirm2.md"
+    : > "$GH_PR_LOG"
+
+    flow_in "pr" "$repo2" --pr "задача"
+    assert_eq "typing pr goes ahead" 0 "$RUN_RC"
+    assert_contains "and the paths are shown first" "$RUN_OUT" "About to commit"
+    assert_contains "and the PR is opened" "$(pr_log)" "pr create"
+fi
+
+if should_run "pr/no-change"; then
+    t "--pr says so when the agent changed nothing"
+    repo="$(make_repo pr-nochange)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=completed
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-nochange.log" GH_PR_BODY="$SANDBOX/gh-nochange.md"
+    : > "$GH_PR_LOG"
+
+    flow "$repo" --pr --yes "задача без изменений"
+
+    assert_ne "the publish reports that there was nothing" 0 "$RUN_RC"
+    assert_contains "and says why" "$RUN_OUT" "Nothing changed"
+    assert_not_contains "and opens no PR" "$(pr_log)" "pr create"
+    assert_contains "the branch itself was still created" "$(pushed_refs "$repo")" "main"
+fi
+
+if should_run "pr/no-gh"; then
+    t "--pr commits and pushes even when gh is missing, and says how to finish"
+    repo="$(make_repo pr-nogh)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo"
+    # gh must be genuinely unreachable, not just the mock: this machine may have a
+    # working gh of its own, which is not what this test is about.
+    no_gh="$(mask_bin gh)"
+    if PATH="$no_gh" command -v gh >/dev/null 2>&1; then
+        bad "gh is unreachable for this test" "still on PATH: $(PATH="$no_gh" command -v gh)"
+    else
+        ok "gh is unreachable for this test"
+    fi
+
+    RUN_OUT="$(cd "$repo" && PATH="$no_gh" bash "$SCRIPT" --pr --yes "задача" 2>&1)"
+    RUN_RC=$?
+
+    branch="$(branch_of "$repo")"
+    assert_contains "the commit still happened" "$RUN_OUT" "Committed to agent/"
+    assert_contains "and so did the push" "$(pushed_refs "$repo")" "$branch"
+    assert_ne "but the run reports the publish as unfinished" 0 "$RUN_RC"
+    assert_contains "gh is named" "$RUN_OUT" "not installed"
+    assert_contains "with the exact command to finish by hand" "$RUN_OUT" "gh pr create --base main"
+fi
+
+if should_run "pr/no-auth"; then
+    t "--pr explains a logged-out gh instead of failing silently"
+    repo="$(make_repo pr-noauth)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-noauth.log" GH_PR_BODY="$SANDBOX/gh-noauth.md" GH_AUTH=fail
+    : > "$GH_PR_LOG"
+
+    flow "$repo" --pr --yes "задача"
+
+    assert_ne "the publish is refused" 0 "$RUN_RC"
+    assert_contains "and the login step is named" "$RUN_OUT" "gh auth login"
+    assert_contains "and the state is named" "$RUN_OUT" "not logged in"
+    assert_contains "while the push still happened" "$RUN_OUT" "Pushed to origin/agent/"
+    assert_not_contains "and no PR was opened" "$(pr_log)" "pr create"
+    unset GH_AUTH
+fi
+
+if should_run "pr/non-agent-branch"; then
+    t "--pr refuses to publish a branch it did not create"
+    repo="$(make_repo pr-nonagent)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-nonagent.log" GH_PR_BODY="$SANDBOX/gh-nonagent.md"
+    : > "$GH_PR_LOG"
+
+    flow "$repo" --pr --no-branch --yes "задача без ветки"
+
+    assert_ne "it refuses" 0 "$RUN_RC"
+    assert_contains "and says why" "$RUN_OUT" "not on an agent branch"
+    assert_contains "and what to do instead" "$RUN_OUT" "--branch"
+    assert_not_contains "and nothing was committed" "$RUN_OUT" "Committed to"
+    assert_not_contains "no PR was opened" "$(pr_log)" "pr create"
+    assert_eq "still on main" "main" "$(branch_of "$repo")"
+fi
+
+if should_run "pr/existing"; then
+    t "a second --pr updates the open pull request instead of opening another"
+    repo="$(make_repo pr-existing)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-existing.log" GH_PR_BODY="$SANDBOX/gh-existing.md"
+    export GH_PR_EXISTING=42
+    : > "$GH_PR_LOG"
+
+    flow "$repo" --pr --yes "задача"
+
+    log="$(pr_log)"
+    assert_not_contains "no second PR" "$log" "pr create"
+    assert_contains "the open one was updated" "$log" "pr edit 42"
+    assert_contains "and its URL is reported" "$RUN_OUT" "pull/42"
+    unset GH_PR_EXISTING
+fi
+
+if should_run "pr/pr-base"; then
+    t "--pr-base overrides the branch the pull request targets"
+    repo="$(make_repo pr-prbase)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo"
+    git -C "$repo" branch -q dev
+    git -C "$repo" checkout -q dev
+    export GH_PR_LOG="$SANDBOX/gh-prbase.log" GH_PR_BODY="$SANDBOX/gh-prbase.md"
+    : > "$GH_PR_LOG"
+
+    flow "$repo" --pr --pr-base main --yes "задача"
+
+    assert_contains "the PR targets the override" \
+        "$(pr_log)" "pr create --base main"
+    assert_not_contains "not the branch the run started from" "$(pr_log)" "--base dev"
+fi
+
+if should_run "pr/no-flags"; then
+    t "without --pr nothing is committed, pushed or published"
+    repo="$(make_repo pr-noflags)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-noflags.log" GH_PR_BODY="$SANDBOX/gh-noflags.md"
+    : > "$GH_PR_LOG"
+
+    flow "$repo" "задача"
+
+    assert_eq "the run is fine" 0 "$RUN_RC"
+    assert_eq "nothing was committed" "0" \
+        "$(git -C "$repo" rev-list --count "main..$(branch_of "$repo")" 2>/dev/null || echo '?')"
+    assert_eq "the agent branch never reached the remote" "main" \
+        "$(pushed_refs "$repo" | tr '\n' ' ' | sed 's/ $//')"
+    assert_eq "gh was never called" "" "$(pr_log)"
+fi
+
+if should_run "pr/modifiers"; then
+    t "the --pr modifiers work on their own"
+    # A modifier that only means something together with --pr, but silently does
+    # nothing without it, is worse than one that implies it.
+    repo="$(make_repo pr-modifiers)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-modifiers.log" GH_PR_BODY="$SANDBOX/gh-modifiers.md"
+    : > "$GH_PR_LOG"
+
+    flow "$repo" --draft --yes "задача"
+    assert_eq "--draft alone publishes" 0 "$RUN_RC"
+    assert_contains "and opens a draft" "$(pr_log)" "pr create"
+    assert_contains "as a draft" "$(pr_log)" "--draft"
+
+    repo2="$(make_repo pr-modifiers2)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo2"
+    export GH_PR_LOG="$SANDBOX/gh-modifiers2.log" GH_PR_BODY="$SANDBOX/gh-modifiers2.md"
+    : > "$GH_PR_LOG"
+
+    flow "$repo2" --pr-base main --yes "задача"
+    assert_eq "--pr-base alone publishes" 0 "$RUN_RC"
+    assert_contains "and targets the given branch" "$(pr_log)" "pr create --base main"
+fi
+
+if should_run "pr/wrong-mode"; then
+    t "--pr on a mode that produces no work says so instead of failing obscurely"
+    repo="$(make_repo pr-wrongmode)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-wrongmode.log" GH_PR_BODY="$SANDBOX/gh-wrongmode.md"
+    : > "$GH_PR_LOG"
+
+    flow "$repo" --pr --prompt-only "подготовить"
+
+    assert_contains "it explains there is nothing to publish" "$RUN_OUT" "nothing to publish"
+    assert_eq "and the run itself still succeeds" 0 "$RUN_RC"
+    assert_not_contains "nothing was committed" "$(pr_log)" "pr create"
+    assert_contains "and no branch was pushed" "$(pushed_refs "$repo")" "main"
 fi
 
 # ------------------------------------------------------------------------------
