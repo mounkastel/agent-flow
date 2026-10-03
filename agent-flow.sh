@@ -86,6 +86,7 @@ Usage:
   agent-flow.sh --show [N]                     Show run N (default 1 = the newest)
   agent-flow.sh --undo                         Remove the agent branch and its uncommitted work
   agent-flow.sh --pr "Task"                    Run, then commit, push and open a pull request
+  agent-flow.sh --publish-only               Commit, push and open a PR for what is already done
   agent-flow.sh --pr --draft "Task"            Same, but as a draft pull request
   echo "task" | agent-flow.sh                  Read the task from stdin
 
@@ -104,6 +105,8 @@ Options:
   --undo                 Return to the base branch and delete the agent branch
   --pr                   After the run: commit, push and open a pull request for the
                          agent branch. Never merges anything -- you review and merge.
+  --publish-only         Run no agent: just commit, push and open the pull request
+                         for the work already sitting in the tree
   --push-only            With --pr: commit and push, but do not open a pull request
   --draft                Open the pull request as a draft (implies --pr)
   --pr-base BRANCH       Target this branch instead of the one the run branched
@@ -245,6 +248,7 @@ while [ $# -gt 0 ]; do
                 *)     SHOW_RUN="$2"; shift ;;
             esac ;;
         --undo)            MODE="undo" ;;
+        --publish-only)    MODE="publish-only" PUSH_PR=1 ;;
         --yes|-y)          ASSUME_YES=1 ;;
         --pr)              PUSH_PR=1 ;;
         --push-only)       PUSH_PR=1 PUSH_ONLY=1 ;;
@@ -3663,6 +3667,30 @@ report_line() { # report_line HEADING -> first non-empty line under that heading
     ' "$LATEST_REPORT" 2>/dev/null || true
 }
 
+do_publish_only() { # --publish-only: publish the tree as it stands, run no agent
+    local word="UNKNOWN"
+    # The draft decision has to come from somewhere. The last report is the only
+    # honest evidence about whether the work is finished, and it is exactly what
+    # --pr used for the run that produced the tree.
+    if [ -s "$LATEST_REPORT" ]; then
+        word="$(report_result)"
+        case "$word" in
+            "$RESULT_COMPLETED"|"$RESULT_PARTIAL"|"$RESULT_BLOCKED"|"$RESULT_FAILED") ;;
+            *) word="UNKNOWN" ;;
+        esac
+    fi
+    if [ "$word" != "$RESULT_COMPLETED" ] && [ "$PR_DRAFT" -ne 1 ]; then
+        PR_DRAFT=1
+        warn "The last run did not report COMPLETED, so the pull request is opened as a draft."
+    fi
+    if publish_run "$word"; then
+        return 0
+    fi
+    # --push-only asked for no pull request, so having none is the outcome.
+    [ "$PUSH_ONLY" -eq 1 ] && return 0
+    return 1
+}
+
 publish_run() { # publish_run RESULT_WORD -> sets PR_URL
     local branch base title summary staged secret n url existing body_file dropped tracked_wf
 
@@ -4985,7 +5013,8 @@ fi
 if [ "$CHOOSE_MODELS" -eq 0 ] \
     && [ "$MODE" != "implement-only" ] && [ "$MODE" != "context-only" ] \
     && [ "$MODE" != "status" ] && [ "$MODE" != "doctor" ] && [ "$MODE" != "history" ] \
-    && [ "$MODE" != "undo" ] && [ "$MODE" != "show" ] && [ -z "$TASK" ]; then
+    && [ "$MODE" != "undo" ] && [ "$MODE" != "show" ] \
+    && [ "$MODE" != "publish-only" ] && [ -z "$TASK" ]; then
     die "No task supplied. Example: ./agent-flow.sh \"Add authentication\""
 fi
 if [ "$CHOOSE_MODELS" -eq 1 ] && [ -n "$TASK" ]; then
@@ -5012,6 +5041,12 @@ case "$MODE" in
     history) ensure_dirs; do_history; exit 0 ;;
     show)    ensure_dirs; do_show "$SHOW_RUN"; exit 0 ;;
     undo)    ensure_dirs; do_undo || exit 1; exit 0 ;;
+    publish-only)
+        ensure_dirs
+        resolve_models
+        do_publish_only || exit 1
+        exit 0
+        ;;
 esac
 
 setup_workflow
