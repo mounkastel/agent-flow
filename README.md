@@ -37,9 +37,58 @@ agent-flow --prompt-only "Add pagination"           # prompt only; review, then 
 agent-flow --implement-only                         # run the prompt that is already there
 agent-flow --setup                                  # install the agent definitions only
 agent-flow --models                                 # pick the models, then exit
+agent-flow --pr "Add pagination"                    # run, then commit, push and open a PR
 ```
 
 Exit codes: `0` done, `2` partial/blocked/failed, `3` no report, `1` workflow error.
+
+## Sending the work: `--pr`
+
+Without it, sending a run to your forge is six commands: inspect the diff, compare against
+the base, switch back, stage, push, delete the branch. With it, one:
+
+```sh
+agent-flow --pr "Turn off the swaylock idle lock"
+```
+
+After the run, the **runner** — not the agent — commits the working tree, pushes the agent
+branch and opens a pull request against the branch the run branched from. You read it and
+merge it.
+
+That split is deliberate. The coding agent has no permission to commit or push, so
+`git add -A` cannot sweep up an unrelated untracked artifact, and the branch that gets
+pushed is exactly the one this run created — not wherever an agent decided to point.
+
+```
+agent-flow --pr "task"          commit, push, open a PR
+agent-flow --pr --draft "task"  ...as a draft
+agent-flow --pr --push-only     commit and push, no PR
+agent-flow --pr --pr-base dev   target dev instead of the branch the run started from
+agent-flow --yes                skip the confirmation
+```
+
+It composes with everything else, so to make it the default:
+
+```sh
+alias af='agent-flow --pr'
+```
+
+**It never merges.** Nothing is auto-enabled. A run that did not report `COMPLETED` is
+opened as a draft with the result in the title, so a blocked run cannot look finished. If a
+pull request for the branch is already open, that one is updated instead of a second being
+opened.
+
+**It refuses to publish anything that looks like a credential.** `.env`, `.netrc`,
+`.npmrc`, `id_rsa`, `*.pem`, `*.key`, `*.p12` and friends are staged but never committed and
+never pushed; the run stops and names the files. This check is not skippable by `--yes`.
+agent-flow's own files (`.agent/`, `.opencode/agents/`) are taken back out of the commit
+and listed, so workflow bookkeeping can never reach a remote.
+
+Before committing, it prints the paths it is about to commit and waits for you to type `pr`.
+`--yes` skips that one prompt.
+
+If `gh` is missing or logged out, the commit and the push still happen — the work is safe
+on the remote — and you are told the exact `gh pr create` line to finish by hand.
 
 ## Finding your way around
 
@@ -74,6 +123,9 @@ task verbatim plus the archived prompt and report.
   tracked changes **and** deletes the files the agent created (`reset --hard` alone would
   leave every new file behind).
 - `.agent/` is kept — it is bookkeeping, and you may still want the report.
+
+After a `--pr` run, `--undo` only tidies up locally. The pushed branch and the open pull
+request stay where they are, because closing a pull request is the reviewer's business.
 
 A clean working tree needs no confirmation, because nothing can be lost.
 
@@ -171,6 +223,7 @@ sandbox: no API calls, no network, nothing written outside `$TMPDIR`. It covers 
 surface, setup, the full cycle and its exit codes, every mode, branch handling, paths with
 spaces and quotes, locking and signal handling, retention, the timeout watchdog, model
 selection, the run records behind `--status`/`--history`/`--show`/`--undo` and its refusal
-to delete commits, the agent contracts, and a set of hostile-input cases. Exit code 0
+to delete commits, publishing with `--pr` (what it opens and everything it refuses to),
+the agent contracts, and a set of hostile-input cases. Exit code 0
 means every assertion passed; `shellcheck -S warning` is also asserted when `shellcheck` is
 installed.

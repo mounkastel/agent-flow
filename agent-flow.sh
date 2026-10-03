@@ -2465,10 +2465,18 @@ work, but refuses to delete commits that exist only on it.
 rebuildable on demand (`--refresh-context`). It is called out as stale once it
 falls far behind HEAD or gets old.
 
+## Sending the work
+
+`agent-flow --pr "task"` runs the task, then the runner commits the working tree,
+pushes the agent branch and opens a pull request against the branch the run
+branched from. The agents never commit or push themselves. Nothing is merged
+automatically: you read the pull request and merge it.
+
 ## Rules
 
 - The repository is the source of truth. Prompts and reports are history.
-- The Coding Agent does not commit. Review `git diff`, then commit yourself.
+- The Coding Agent does not commit. Review `git diff`, then commit yourself --
+  or let `--pr` do it for you.
 - Reports include a "Repository Snapshot" appended by the runner from real
   `git` output, independent of what the agent claims.
 - Concurrency: one run per repository (lock in `.agent/runtime/lock`). A stale
@@ -3651,7 +3659,7 @@ report_line() { # report_line HEADING -> first non-empty line under that heading
 }
 
 publish_run() { # publish_run RESULT_WORD -> sets PR_URL
-    local branch base title summary staged secret n url existing body_file
+    local branch base title summary staged secret n url existing body_file dropped tracked_wf
 
     [ "$PUSH_PR" -eq 1 ] || return 0
     PR_URL=""
@@ -3673,20 +3681,6 @@ publish_run() { # publish_run RESULT_WORD -> sets PR_URL
         warn "--pr: this repository has no 'origin' remote. Nothing was pushed."
         return 1
     fi
-    if ! command -v gh >/dev/null 2>&1; then
-        warn "--pr: the GitHub CLI (gh) is not installed, so no pull request can be opened."
-        printf '  The commit and push still happen. Open the PR by hand:\n'
-        printf '      gh pr create --base %s --head %s\n\n' "$(resolve_pr_base)" "$branch"
-        return 1
-    fi
-    if ! gh auth status >/dev/null 2>&1; then
-        warn "--pr: gh is installed but not authenticated (gh auth status)."
-        printf '  The commit and push still happen. Then run: gh auth login\n'
-        printf '  and open the PR by hand:\n'
-        printf '      gh pr create --base %s --head %s\n\n' "$(resolve_pr_base)" "$branch"
-        return 1
-    fi
-
     base="$(resolve_pr_base)"
     if [ "$base" = "$branch" ]; then
         warn "--pr: the PR base is the branch itself ($branch). Nothing to publish."
@@ -3694,9 +3688,28 @@ publish_run() { # publish_run RESULT_WORD -> sets PR_URL
     fi
 
     git add -A || { error "Could not stage changes; nothing was committed."; return 1; }
+
+    # The workflow's own directories are not the agent's work. .git/info/exclude
+    # keeps them out of `git add -A`, but exclude rules do not apply to files
+    # that are already tracked -- and a repository that committed .agent/ once
+    # (which older versions of this tool made easy) would otherwise get a
+    # report and a log in every single commit.
+    dropped="$(git diff --cached --name-only -- .agent .opencode/agents 2>/dev/null || true)"
+    tracked_wf=""
+    if [ -n "$dropped" ]; then
+        tracked_wf="$(git ls-files -- .agent .opencode/agents 2>/dev/null | head -n 1 || true)"
+        git reset -q -- .agent .opencode/agents >/dev/null 2>&1 || true
+    fi
+
     if git diff --cached --quiet; then
         printf '\n'
-        warn "Nothing changed, so there is nothing to open a pull request for."
+        if [ -n "$dropped" ]; then
+            warn "The only changes were agent-flow's own files, so there is nothing to publish:"
+            printf '%s\n' "$dropped" | sed 's/^/    /' >&2
+            printf '  Add .agent/ and .opencode/agents/ to .gitignore to keep this quiet.\n'
+        else
+            warn "Nothing changed, so there is nothing to open a pull request for."
+        fi
         git reset -q
         return 1
     fi
@@ -3715,14 +3728,18 @@ publish_run() { # publish_run RESULT_WORD -> sets PR_URL
         printf '  To drop them from the commit for now: git reset\n'
         return 1
     fi
-    if printf '%s\n' "$staged" | grep -qE '^\.agent/|^\.opencode/agents/'; then
-        error "Workflow bookkeeping would be committed. Run --setup first; nothing was committed."
-        git reset -q
-        return 1
-    fi
 
     n="$(printf '%s\n' "$staged" | grep -c . || true)"
     printf '\n'
+    if [ -n "$dropped" ]; then
+        printf 'Left out of the commit (agent-flow bookkeeping):\n'
+        printf '%s\n' "$dropped" | sed 's/^/    /' >&2
+        if [ -n "$tracked_wf" ]; then
+            printf '  These are tracked in this repository, which is why they kept coming\n'
+            printf '  back. To stop that for good:\n'
+            printf '      git rm -r --cached .agent .opencode/agents\n'
+        fi
+    fi
     info "About to commit $n path(s) to $branch:"
     printf '%s\n' "$staged" | sed 's/^/    /' >&2
     if [ "$ASSUME_YES" -ne 1 ]; then
@@ -3780,14 +3797,42 @@ Base:   $base"; then
     rm -f "$RUNTIME_DIR/push-err.$$" 2>/dev/null || true
     success "Pushed to origin/$branch."
 
-    existing="$(gh pr list --head "$branch" --state open --json number -q '.[].number' 2>/dev/null | head -n 1 || true)"
+    # gh is checked only now, after the work is safely on the remote. Losing the
+    # PR step should not lose the commit and the push, and the branch can always
+    # be turned into a pull request later.
     if [ "$PUSH_ONLY" -eq 1 ]; then
-        url=""
-        if [ -n "$existing" ]; then
-            gh pr edit "$existing" --title "$title" --body-file "$body_file" >/dev/null 2>&1 || true
-            url="$(gh pr view "$existing" --json url -q .url 2>/dev/null || true)"
+        PR_URL=""
+        if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+            existing="$(gh pr list --head "$branch" --state open --json number -q '.[].number' 2>/dev/null | head -n 1 || true)"
+            if [ -n "$existing" ]; then
+                gh pr edit "$existing" --title "$title" --body-file "$body_file" >/dev/null 2>&1 || true
+                url="$(gh pr view "$existing" --json url -q .url 2>/dev/null || true)"
+                PR_URL="$url"
+                [ -n "$PR_URL" ] && success "Pull request: $PR_URL"
+            fi
         fi
-    elif [ -n "$existing" ]; then
+        rm -f "$body_file" 2>/dev/null || true
+        return 0
+    fi
+    if ! command -v gh >/dev/null 2>&1; then
+        rm -f "$body_file" 2>/dev/null || true
+        warn "--pr: the GitHub CLI (gh) is not installed, so no pull request was opened."
+        printf '  The commit and the push are done and safe. Open the PR by hand:\n'
+        printf '      gh pr create --base %s --head %s\n' "$base" "$branch"
+        return 1
+    fi
+    if ! gh auth status >/dev/null 2>&1; then
+        rm -f "$body_file" 2>/dev/null || true
+        warn "--pr: gh is installed but not logged in, so no pull request was opened."
+        printf '  The commit and the push are done and safe. Log in with:\n'
+        printf '      gh auth login\n'
+        printf '  then open the pull request by hand:\n'
+        printf '      gh pr create --base %s --head %s\n' "$base" "$branch"
+        return 1
+    fi
+
+    existing="$(gh pr list --head "$branch" --state open --json number -q '.[].number' 2>/dev/null | head -n 1 || true)"
+    if [ -n "$existing" ]; then
         gh pr edit "$existing" --title "$title" --body-file "$body_file" >/dev/null 2>&1 || true
         url="$(gh pr view "$existing" --json url -q .url 2>/dev/null || true)"
     else
