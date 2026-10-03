@@ -341,17 +341,68 @@ description: Investigates the repository and writes an execution-ready prompt fo
 mode: primary
 steps: 200
 permissions:
-  # OpenCode V2 permission rules. The LAST matching rule wins, so every broad
-  # rule comes before its exceptions.
-  - action: "*"
-    resource: "*"
-    effect: deny
-  # Read-only shell. An agent that cannot run `git log` or `ls` does not stop:
-  # it works around it by reading .git/HEAD, .git/config and .git/logs/HEAD as
-  # files and globbing .git/refs/*, which costs many times more calls for
-  # strictly less information, and still misses what it needed.
+  # OpenCode V2 ordered rules; the LAST matching rule wins.
+  #
+  # Note the absence of a catch-all `action: "*" / resource: "*" -> deny`.
+  # When that is the effective rule for everything, opencode refuses to serve
+  # its own free models to such an agent ("OpenCode's free tier can only be used
+  # from within OpenCode") and the agent cannot run at all. That is verified
+  # behaviour, not a guess: the rule is precise about which match triggers it --
+  # a deny on `action: "edit"` or on `resource: "rm*"` is served normally, only
+  # a deny that ends up catching the whole `*/*` namespace is not.
+  #
+  # So this list is exhaustive in the other direction instead, which the
+  # permission engine enforces identically: everything wanted is allowed
+  # explicitly, everything dangerous is denied explicitly.
+  #
+  # --- allowed: reading, and checks that do not change the repository ---
   - action: "bash"
-    resource: "git *"
+    resource: "git status*"
+    effect: allow
+  - action: "bash"
+    resource: "git log*"
+    effect: allow
+  - action: "bash"
+    resource: "git diff*"
+    effect: allow
+  - action: "bash"
+    resource: "git show*"
+    effect: allow
+  - action: "bash"
+    resource: "git ls-files*"
+    effect: allow
+  - action: "bash"
+    resource: "git blame*"
+    effect: allow
+  - action: "bash"
+    resource: "git describe*"
+    effect: allow
+  - action: "bash"
+    resource: "git rev-parse*"
+    effect: allow
+  - action: "bash"
+    resource: "git rev-list*"
+    effect: allow
+  - action: "bash"
+    resource: "git shortlog*"
+    effect: allow
+  - action: "bash"
+    resource: "git branch*"
+    effect: allow
+  - action: "bash"
+    resource: "git for-each-ref*"
+    effect: allow
+  - action: "bash"
+    resource: "git cat-file*"
+    effect: allow
+  - action: "bash"
+    resource: "git grep*"
+    effect: allow
+  - action: "bash"
+    resource: "git config --get*"
+    effect: allow
+  - action: "bash"
+    resource: "git config --list*"
     effect: allow
   - action: "bash"
     resource: "ls*"
@@ -420,7 +471,16 @@ permissions:
     resource: "which*"
     effect: allow
   - action: "bash"
+    resource: "command -v*"
+    effect: allow
+  - action: "bash"
     resource: "echo*"
+    effect: allow
+  - action: "bash"
+    resource: "printf*"
+    effect: allow
+  - action: "bash"
+    resource: "id*"
     effect: allow
   - action: "bash"
     resource: "uname*"
@@ -432,9 +492,6 @@ permissions:
     resource: "date*"
     effect: allow
   - action: "bash"
-    resource: "id*"
-    effect: allow
-  - action: "bash"
     resource: "df*"
     effect: allow
   - action: "bash"
@@ -443,8 +500,18 @@ permissions:
   - action: "bash"
     resource: "ps*"
     effect: allow
-  # Checks are allowed because a briefing that says "run the tests" without ever
-  # running them is a guess.
+  - action: "bash"
+    resource: "env"
+    effect: allow
+  - action: "bash"
+    resource: "basename*"
+    effect: allow
+  - action: "bash"
+    resource: "dirname*"
+    effect: allow
+  - action: "bash"
+    resource: "realpath*"
+    effect: allow
   - action: "bash"
     resource: "bash -n*"
     effect: allow
@@ -472,8 +539,28 @@ permissions:
   - action: "bash"
     resource: "pytest*"
     effect: allow
-  # git is readable above but never mutating: the earlier `git *` rule allowed
-  # everything, so every writing subcommand is taken back here.
+  - action: "bash"
+    resource: "node --check*"
+    effect: allow
+  - action: "bash"
+    resource: "python3 -m py_compile*"
+    effect: allow
+  - action: "read"
+    resource: "*"
+    effect: allow
+  - action: "glob"
+    resource: "*"
+    effect: allow
+  - action: "grep"
+    resource: "*"
+    effect: allow
+  - action: "lsp"
+    resource: "*"
+    effect: allow
+  # --- denied: anything that changes the repository or the machine ---
+  - action: "bash"
+    resource: "git add*"
+    effect: deny
   - action: "bash"
     resource: "git commit*"
     effect: deny
@@ -488,6 +575,9 @@ permissions:
     effect: deny
   - action: "bash"
     resource: "git switch*"
+    effect: deny
+  - action: "bash"
+    resource: "git restore*"
     effect: deny
   - action: "bash"
     resource: "git clean*"
@@ -505,10 +595,68 @@ permissions:
     resource: "git revert*"
     effect: deny
   - action: "bash"
-    resource: "git add*"
+    resource: "git cherry-pick*"
     effect: deny
-  # Mutations, privilege and anything reaching off the machine are denied again:
-  # this agent has no business performing them.
+  - action: "bash"
+    resource: "git am*"
+    effect: deny
+  - action: "bash"
+    resource: "git apply*"
+    effect: deny
+  - action: "bash"
+    resource: "git rm *"
+    effect: deny
+  - action: "bash"
+    resource: "git mv *"
+    effect: deny
+  - action: "bash"
+    resource: "git worktree*"
+    effect: deny
+  - action: "bash"
+    resource: "git filter-branch*"
+    effect: deny
+  - action: "bash"
+    resource: "git filter-repo*"
+    effect: deny
+  - action: "bash"
+    resource: "git update-ref*"
+    effect: deny
+  - action: "bash"
+    resource: "git symbolic-ref*"
+    effect: deny
+  - action: "bash"
+    resource: "git replace*"
+    effect: deny
+  - action: "bash"
+    resource: "git reflog*"
+    effect: deny
+  - action: "bash"
+    resource: "git remote*"
+    effect: deny
+  - action: "bash"
+    resource: "git config --unset*"
+    effect: deny
+  - action: "bash"
+    resource: "git config user*"
+    effect: deny
+  - action: "bash"
+    resource: "git config alias*"
+    effect: deny
+  - action: "bash"
+    resource: "git gc*"
+    effect: deny
+  - action: "bash"
+    resource: "git prune*"
+    effect: deny
+  - action: "bash"
+    resource: "git repack*"
+    effect: deny
+  - action: "bash"
+    resource: "git bisect*"
+    effect: deny
+  - action: "bash"
+    resource: "git submodule*"
+    effect: deny
   - action: "bash"
     resource: "rm*"
     effect: deny
@@ -525,16 +673,34 @@ permissions:
     resource: "chown*"
     effect: deny
   - action: "bash"
+    resource: "chgrp*"
+    effect: deny
+  - action: "bash"
     resource: "mkdir*"
     effect: deny
   - action: "bash"
+    resource: "rmdir*"
+    effect: deny
+  - action: "bash"
     resource: "touch*"
+    effect: deny
+  - action: "bash"
+    resource: "ln*"
     effect: deny
   - action: "bash"
     resource: "dd*"
     effect: deny
   - action: "bash"
     resource: "mkfs*"
+    effect: deny
+  - action: "bash"
+    resource: "truncate*"
+    effect: deny
+  - action: "bash"
+    resource: "shred*"
+    effect: deny
+  - action: "bash"
+    resource: "install*"
     effect: deny
   - action: "bash"
     resource: "curl*"
@@ -546,28 +712,112 @@ permissions:
     resource: "ssh*"
     effect: deny
   - action: "bash"
+    resource: "scp*"
+    effect: deny
+  - action: "bash"
+    resource: "sftp*"
+    effect: deny
+  - action: "bash"
+    resource: "rsync*"
+    effect: deny
+  - action: "bash"
+    resource: "nc*"
+    effect: deny
+  - action: "bash"
+    resource: "ncat*"
+    effect: deny
+  - action: "bash"
     resource: "sudo*"
     effect: deny
   - action: "bash"
     resource: "su*"
     effect: deny
   - action: "bash"
+    resource: "doas*"
+    effect: deny
+  - action: "bash"
+    resource: "pkexec*"
+    effect: deny
+  - action: "bash"
+    resource: "runuser*"
+    effect: deny
+  - action: "bash"
     resource: "systemctl*"
+    effect: deny
+  - action: "bash"
+    resource: "launchctl*"
+    effect: deny
+  - action: "bash"
+    resource: "crontab*"
+    effect: deny
+  - action: "bash"
+    resource: "shutdown*"
+    effect: deny
+  - action: "bash"
+    resource: "reboot*"
+    effect: deny
+  - action: "bash"
+    resource: "poweroff*"
+    effect: deny
+  - action: "bash"
+    resource: "halt*"
     effect: deny
   - action: "bash"
     resource: "kill*"
     effect: deny
   - action: "bash"
+    resource: "killall*"
+    effect: deny
+  - action: "bash"
     resource: "pkill*"
+    effect: deny
+  - action: "bash"
+    resource: "mount*"
+    effect: deny
+  - action: "bash"
+    resource: "umount*"
     effect: deny
   - action: "bash"
     resource: "npm install*"
     effect: deny
   - action: "bash"
+    resource: "npm publish*"
+    effect: deny
+  - action: "bash"
+    resource: "npm login*"
+    effect: deny
+  - action: "bash"
+    resource: "pnpm add -g*"
+    effect: deny
+  - action: "bash"
+    resource: "yarn global add*"
+    effect: deny
+  - action: "bash"
+    resource: "yarn publish*"
+    effect: deny
+  - action: "bash"
     resource: "pip install*"
     effect: deny
   - action: "bash"
+    resource: "pipx install*"
+    effect: deny
+  - action: "bash"
     resource: "cargo install*"
+    effect: deny
+  - action: "bash"
+    resource: "gem install*"
+    effect: deny
+  - action: "bash"
+    resource: "go get*"
+    effect: deny
+  - action: "bash"
+    resource: "cargo publish*"
+    effect: deny
+  - action: "bash"
+    resource: "twine upload*"
+    effect: deny
+  - action: "bash"
+    resource: "gh release*"
     effect: deny
   - action: "question"
     resource: "*"
@@ -584,9 +834,11 @@ permissions:
   - action: "websearch"
     resource: "*"
     effect: deny
-  - action: "external_directory"
+  - action: "task"
     resource: "*"
-    effect: ask
+    effect: deny
+  # Secrets live outside the work tree; keep them there, and ask before the
+  # rest of it so nothing outside the repository goes out unnoticed.
   - action: "external_directory"
     resource: "$HOME/.ssh/*"
     effect: deny
@@ -600,9 +852,6 @@ permissions:
     resource: "$HOME/.kube/*"
     effect: deny
   - action: "external_directory"
-    resource: "$HOME/.config/opencode/*"
-    effect: deny
-  - action: "external_directory"
     resource: "$HOME/.netrc"
     effect: deny
   - action: "external_directory"
@@ -610,6 +859,27 @@ permissions:
     effect: deny
   - action: "external_directory"
     resource: "$HOME/.gitconfig"
+    effect: deny
+  - action: "external_directory"
+    resource: "$HOME/.config/opencode/*"
+    effect: deny
+  - action: "external_directory"
+    resource: "$HOME/.config/gh/*"
+    effect: deny
+  - action: "external_directory"
+    resource: "$HOME/.config/gcloud/*"
+    effect: deny
+  - action: "external_directory"
+    resource: "$HOME/.npmrc"
+    effect: deny
+  - action: "external_directory"
+    resource: "$HOME/.pypirc"
+    effect: deny
+  - action: "external_directory"
+    resource: "$HOME/.gem/credentials"
+    effect: deny
+  - action: "external_directory"
+    resource: "$HOME/.local/share/keyrings/*"
     effect: deny
   - action: "external_directory"
     resource: "/etc/*"
@@ -621,27 +891,9 @@ permissions:
     resource: "/root/*"
     effect: deny
   - action: "external_directory"
-    resource: "$HOME/.config/gh/*"
-    effect: deny
-  - action: "external_directory"
-    resource: "$HOME/.config/gcloud/*"
-    effect: deny
-  - action: "external_directory"
-    resource: "$HOME/.local/share/keyrings/*"
-    effect: deny
-  - action: "external_directory"
-    resource: "$HOME/.npmrc"
-    effect: deny
-  - action: "external_directory"
-    resource: "$HOME/.pypirc"
-    effect: deny
-  - action: "external_directory"
-    resource: "$HOME/.gem/credentials"
-    effect: deny
-  # Read the repository; never read secrets. `.env.example` stays readable.
-  - action: "read"
     resource: "*"
-    effect: allow
+    effect: ask
+  # .env files stay unreadable even inside the work tree.
   - action: "read"
     resource: "*.env"
     effect: deny
@@ -651,19 +903,14 @@ permissions:
   - action: "read"
     resource: "*.env.example"
     effect: allow
-  - action: "glob"
-    resource: "*"
-    effect: allow
-  - action: "grep"
-    resource: "*"
-    effect: allow
-  # Exactly one writable file: the draft.
+  # --- exactly one writable file: the draft ---
   - action: "edit"
     resource: "*"
     effect: deny
   - action: "edit"
     resource: ".agent/prompts/draft.md"
     effect: allow
+
 ---
 
 # Prompt Engineer
@@ -1468,17 +1715,68 @@ description: Builds a verified project briefing (.agent/context/PROJECT.md) that
 mode: primary
 steps: 120
 permissions:
-  # OpenCode V2 permission rules. The LAST matching rule wins, so every broad
-  # rule comes before its exceptions.
-  - action: "*"
-    resource: "*"
-    effect: deny
-  # Read-only shell. An agent that cannot run `git log` or `ls` does not stop:
-  # it works around it by reading .git/HEAD, .git/config and .git/logs/HEAD as
-  # files and globbing .git/refs/*, which costs many times more calls for
-  # strictly less information, and still misses what it needed.
+  # OpenCode V2 ordered rules; the LAST matching rule wins.
+  #
+  # Note the absence of a catch-all `action: "*" / resource: "*" -> deny`.
+  # When that is the effective rule for everything, opencode refuses to serve
+  # its own free models to such an agent ("OpenCode's free tier can only be used
+  # from within OpenCode") and the agent cannot run at all. That is verified
+  # behaviour, not a guess: the rule is precise about which match triggers it --
+  # a deny on `action: "edit"` or on `resource: "rm*"` is served normally, only
+  # a deny that ends up catching the whole `*/*` namespace is not.
+  #
+  # So this list is exhaustive in the other direction instead, which the
+  # permission engine enforces identically: everything wanted is allowed
+  # explicitly, everything dangerous is denied explicitly.
+  #
+  # --- allowed: reading, and checks that do not change the repository ---
   - action: "bash"
-    resource: "git *"
+    resource: "git status*"
+    effect: allow
+  - action: "bash"
+    resource: "git log*"
+    effect: allow
+  - action: "bash"
+    resource: "git diff*"
+    effect: allow
+  - action: "bash"
+    resource: "git show*"
+    effect: allow
+  - action: "bash"
+    resource: "git ls-files*"
+    effect: allow
+  - action: "bash"
+    resource: "git blame*"
+    effect: allow
+  - action: "bash"
+    resource: "git describe*"
+    effect: allow
+  - action: "bash"
+    resource: "git rev-parse*"
+    effect: allow
+  - action: "bash"
+    resource: "git rev-list*"
+    effect: allow
+  - action: "bash"
+    resource: "git shortlog*"
+    effect: allow
+  - action: "bash"
+    resource: "git branch*"
+    effect: allow
+  - action: "bash"
+    resource: "git for-each-ref*"
+    effect: allow
+  - action: "bash"
+    resource: "git cat-file*"
+    effect: allow
+  - action: "bash"
+    resource: "git grep*"
+    effect: allow
+  - action: "bash"
+    resource: "git config --get*"
+    effect: allow
+  - action: "bash"
+    resource: "git config --list*"
     effect: allow
   - action: "bash"
     resource: "ls*"
@@ -1547,7 +1845,16 @@ permissions:
     resource: "which*"
     effect: allow
   - action: "bash"
+    resource: "command -v*"
+    effect: allow
+  - action: "bash"
     resource: "echo*"
+    effect: allow
+  - action: "bash"
+    resource: "printf*"
+    effect: allow
+  - action: "bash"
+    resource: "id*"
     effect: allow
   - action: "bash"
     resource: "uname*"
@@ -1559,9 +1866,6 @@ permissions:
     resource: "date*"
     effect: allow
   - action: "bash"
-    resource: "id*"
-    effect: allow
-  - action: "bash"
     resource: "df*"
     effect: allow
   - action: "bash"
@@ -1570,8 +1874,18 @@ permissions:
   - action: "bash"
     resource: "ps*"
     effect: allow
-  # Checks are allowed because a briefing that says "run the tests" without ever
-  # running them is a guess.
+  - action: "bash"
+    resource: "env"
+    effect: allow
+  - action: "bash"
+    resource: "basename*"
+    effect: allow
+  - action: "bash"
+    resource: "dirname*"
+    effect: allow
+  - action: "bash"
+    resource: "realpath*"
+    effect: allow
   - action: "bash"
     resource: "bash -n*"
     effect: allow
@@ -1599,8 +1913,28 @@ permissions:
   - action: "bash"
     resource: "pytest*"
     effect: allow
-  # git is readable above but never mutating: the earlier `git *` rule allowed
-  # everything, so every writing subcommand is taken back here.
+  - action: "bash"
+    resource: "node --check*"
+    effect: allow
+  - action: "bash"
+    resource: "python3 -m py_compile*"
+    effect: allow
+  - action: "read"
+    resource: "*"
+    effect: allow
+  - action: "glob"
+    resource: "*"
+    effect: allow
+  - action: "grep"
+    resource: "*"
+    effect: allow
+  - action: "lsp"
+    resource: "*"
+    effect: allow
+  # --- denied: anything that changes the repository or the machine ---
+  - action: "bash"
+    resource: "git add*"
+    effect: deny
   - action: "bash"
     resource: "git commit*"
     effect: deny
@@ -1615,6 +1949,9 @@ permissions:
     effect: deny
   - action: "bash"
     resource: "git switch*"
+    effect: deny
+  - action: "bash"
+    resource: "git restore*"
     effect: deny
   - action: "bash"
     resource: "git clean*"
@@ -1632,10 +1969,68 @@ permissions:
     resource: "git revert*"
     effect: deny
   - action: "bash"
-    resource: "git add*"
+    resource: "git cherry-pick*"
     effect: deny
-  # Mutations, privilege and anything reaching off the machine are denied again:
-  # this agent has no business performing them.
+  - action: "bash"
+    resource: "git am*"
+    effect: deny
+  - action: "bash"
+    resource: "git apply*"
+    effect: deny
+  - action: "bash"
+    resource: "git rm *"
+    effect: deny
+  - action: "bash"
+    resource: "git mv *"
+    effect: deny
+  - action: "bash"
+    resource: "git worktree*"
+    effect: deny
+  - action: "bash"
+    resource: "git filter-branch*"
+    effect: deny
+  - action: "bash"
+    resource: "git filter-repo*"
+    effect: deny
+  - action: "bash"
+    resource: "git update-ref*"
+    effect: deny
+  - action: "bash"
+    resource: "git symbolic-ref*"
+    effect: deny
+  - action: "bash"
+    resource: "git replace*"
+    effect: deny
+  - action: "bash"
+    resource: "git reflog*"
+    effect: deny
+  - action: "bash"
+    resource: "git remote*"
+    effect: deny
+  - action: "bash"
+    resource: "git config --unset*"
+    effect: deny
+  - action: "bash"
+    resource: "git config user*"
+    effect: deny
+  - action: "bash"
+    resource: "git config alias*"
+    effect: deny
+  - action: "bash"
+    resource: "git gc*"
+    effect: deny
+  - action: "bash"
+    resource: "git prune*"
+    effect: deny
+  - action: "bash"
+    resource: "git repack*"
+    effect: deny
+  - action: "bash"
+    resource: "git bisect*"
+    effect: deny
+  - action: "bash"
+    resource: "git submodule*"
+    effect: deny
   - action: "bash"
     resource: "rm*"
     effect: deny
@@ -1652,16 +2047,34 @@ permissions:
     resource: "chown*"
     effect: deny
   - action: "bash"
+    resource: "chgrp*"
+    effect: deny
+  - action: "bash"
     resource: "mkdir*"
     effect: deny
   - action: "bash"
+    resource: "rmdir*"
+    effect: deny
+  - action: "bash"
     resource: "touch*"
+    effect: deny
+  - action: "bash"
+    resource: "ln*"
     effect: deny
   - action: "bash"
     resource: "dd*"
     effect: deny
   - action: "bash"
     resource: "mkfs*"
+    effect: deny
+  - action: "bash"
+    resource: "truncate*"
+    effect: deny
+  - action: "bash"
+    resource: "shred*"
+    effect: deny
+  - action: "bash"
+    resource: "install*"
     effect: deny
   - action: "bash"
     resource: "curl*"
@@ -1673,28 +2086,112 @@ permissions:
     resource: "ssh*"
     effect: deny
   - action: "bash"
+    resource: "scp*"
+    effect: deny
+  - action: "bash"
+    resource: "sftp*"
+    effect: deny
+  - action: "bash"
+    resource: "rsync*"
+    effect: deny
+  - action: "bash"
+    resource: "nc*"
+    effect: deny
+  - action: "bash"
+    resource: "ncat*"
+    effect: deny
+  - action: "bash"
     resource: "sudo*"
     effect: deny
   - action: "bash"
     resource: "su*"
     effect: deny
   - action: "bash"
+    resource: "doas*"
+    effect: deny
+  - action: "bash"
+    resource: "pkexec*"
+    effect: deny
+  - action: "bash"
+    resource: "runuser*"
+    effect: deny
+  - action: "bash"
     resource: "systemctl*"
+    effect: deny
+  - action: "bash"
+    resource: "launchctl*"
+    effect: deny
+  - action: "bash"
+    resource: "crontab*"
+    effect: deny
+  - action: "bash"
+    resource: "shutdown*"
+    effect: deny
+  - action: "bash"
+    resource: "reboot*"
+    effect: deny
+  - action: "bash"
+    resource: "poweroff*"
+    effect: deny
+  - action: "bash"
+    resource: "halt*"
     effect: deny
   - action: "bash"
     resource: "kill*"
     effect: deny
   - action: "bash"
+    resource: "killall*"
+    effect: deny
+  - action: "bash"
     resource: "pkill*"
+    effect: deny
+  - action: "bash"
+    resource: "mount*"
+    effect: deny
+  - action: "bash"
+    resource: "umount*"
     effect: deny
   - action: "bash"
     resource: "npm install*"
     effect: deny
   - action: "bash"
+    resource: "npm publish*"
+    effect: deny
+  - action: "bash"
+    resource: "npm login*"
+    effect: deny
+  - action: "bash"
+    resource: "pnpm add -g*"
+    effect: deny
+  - action: "bash"
+    resource: "yarn global add*"
+    effect: deny
+  - action: "bash"
+    resource: "yarn publish*"
+    effect: deny
+  - action: "bash"
     resource: "pip install*"
     effect: deny
   - action: "bash"
+    resource: "pipx install*"
+    effect: deny
+  - action: "bash"
     resource: "cargo install*"
+    effect: deny
+  - action: "bash"
+    resource: "gem install*"
+    effect: deny
+  - action: "bash"
+    resource: "go get*"
+    effect: deny
+  - action: "bash"
+    resource: "cargo publish*"
+    effect: deny
+  - action: "bash"
+    resource: "twine upload*"
+    effect: deny
+  - action: "bash"
+    resource: "gh release*"
     effect: deny
   - action: "question"
     resource: "*"
@@ -1711,9 +2208,11 @@ permissions:
   - action: "websearch"
     resource: "*"
     effect: deny
-  - action: "external_directory"
+  - action: "task"
     resource: "*"
-    effect: ask
+    effect: deny
+  # Secrets live outside the work tree; keep them there, and ask before the
+  # rest of it so nothing outside the repository goes out unnoticed.
   - action: "external_directory"
     resource: "$HOME/.ssh/*"
     effect: deny
@@ -1727,9 +2226,6 @@ permissions:
     resource: "$HOME/.kube/*"
     effect: deny
   - action: "external_directory"
-    resource: "$HOME/.config/opencode/*"
-    effect: deny
-  - action: "external_directory"
     resource: "$HOME/.netrc"
     effect: deny
   - action: "external_directory"
@@ -1737,6 +2233,27 @@ permissions:
     effect: deny
   - action: "external_directory"
     resource: "$HOME/.gitconfig"
+    effect: deny
+  - action: "external_directory"
+    resource: "$HOME/.config/opencode/*"
+    effect: deny
+  - action: "external_directory"
+    resource: "$HOME/.config/gh/*"
+    effect: deny
+  - action: "external_directory"
+    resource: "$HOME/.config/gcloud/*"
+    effect: deny
+  - action: "external_directory"
+    resource: "$HOME/.npmrc"
+    effect: deny
+  - action: "external_directory"
+    resource: "$HOME/.pypirc"
+    effect: deny
+  - action: "external_directory"
+    resource: "$HOME/.gem/credentials"
+    effect: deny
+  - action: "external_directory"
+    resource: "$HOME/.local/share/keyrings/*"
     effect: deny
   - action: "external_directory"
     resource: "/etc/*"
@@ -1748,26 +2265,9 @@ permissions:
     resource: "/root/*"
     effect: deny
   - action: "external_directory"
-    resource: "$HOME/.config/gh/*"
-    effect: deny
-  - action: "external_directory"
-    resource: "$HOME/.config/gcloud/*"
-    effect: deny
-  - action: "external_directory"
-    resource: "$HOME/.local/share/keyrings/*"
-    effect: deny
-  - action: "external_directory"
-    resource: "$HOME/.npmrc"
-    effect: deny
-  - action: "external_directory"
-    resource: "$HOME/.pypirc"
-    effect: deny
-  - action: "external_directory"
-    resource: "$HOME/.gem/credentials"
-    effect: deny
-  - action: "read"
     resource: "*"
-    effect: allow
+    effect: ask
+  # .env files stay unreadable even inside the work tree.
   - action: "read"
     resource: "*.env"
     effect: deny
@@ -1777,19 +2277,14 @@ permissions:
   - action: "read"
     resource: "*.env.example"
     effect: allow
-  - action: "glob"
-    resource: "*"
-    effect: allow
-  - action: "grep"
-    resource: "*"
-    effect: allow
-  # Exactly one writable file: the briefing draft.
+  # --- exactly one writable file: the draft ---
   - action: "edit"
     resource: "*"
     effect: deny
   - action: "edit"
     resource: ".agent/context/PROJECT.draft.md"
     effect: allow
+
 ---
 
 # Context Builder
@@ -2012,7 +2507,7 @@ install_agent_file() {
 # Cheap static sanity check of our own templates. A legacy V1 `permission:` block
 # is silently ignored by OpenCode V2, which would leave the agents unrestricted.
 check_agent_templates() {
-    local f label missing=0 noshell=0
+    local f label missing=0 fatal=0
     for f in "$PROMPT_ENGINEER_FILE" "$CODING_AGENT_FILE" "$CONTEXT_BUILDER_FILE"; do
         label="${f##*/}"
         label="${label%.md}"
@@ -2025,22 +2520,29 @@ check_agent_templates() {
             warn "$label has no 'permissions:' block: the agent runs with OpenCode defaults."
             missing=1
         fi
+        if agent_denies_everything "$f"; then
+            fatal=1
+            error "$label ends with a catch-all deny (action: \"*\" / resource: \"*\").
+       opencode then refuses to serve its own free models to that agent
+       (\"free tier can only be used from within OpenCode\") and it cannot run
+       at all. Deny the dangerous actions by name instead -- a targeted deny
+       is served normally. Fix with --setup --force."
+        fi
     done
-    # The two research agents start from `action: "*" -> deny`. If nothing ever
-    # allows `bash`, they cannot run `git log` or `ls`, and they do not fail --
-    # they quietly rebuild git state by reading .git/HEAD as text, which costs
-    # many times more calls for less information. Running anyway just burns
+    # The two research agents need a shell to do their job. Without one they do
+    # not fail -- they rebuild git state by reading .git/HEAD as text, which
+    # costs many times more calls for less information. Running anyway just burns
     # tokens on a result we already know will be poor.
     for f in "$PROMPT_ENGINEER_FILE" "$CONTEXT_BUILDER_FILE"; do
         [ -f "$f" ] || continue
         if ! agent_allows_shell "$f"; then
-            noshell=1
+            fatal=1
             error "${f##*/} allows no shell command: it cannot run git log, ls or grep, and will reconstruct repository state by reading files such as .git/HEAD."
         fi
     done
-    if [ "$noshell" -eq 1 ]; then
+    if [ "$fatal" -eq 1 ]; then
         printf '\n'
-        error "This run would waste tokens: the agents above cannot inspect the repository."
+        error "This run cannot work as configured."
         printf '  Refresh the agent definitions once:\n\n'
         printf '      %s --setup --force\n\n' "$SELF_NAME"
         printf '  They are installed per repository, so an older copy in another\n'
@@ -2058,6 +2560,29 @@ agent_allows_shell() { # agent_allows_shell FILE -> 0 if any bash rule allows
         inblock && /action:/ { inbash = 0 }
         inblock && inbash && /effect:[[:space:]]*"?allow"?/ { found = 1 }
         END { exit(found ? 0 : 1) }
+    ' "$1" 2>/dev/null
+}
+
+agent_denies_everything() { # agent_denies_everything FILE
+    # True when the LAST rule matching the whole `*`/`*` namespace is a deny.
+    # That exact shape -- and only that shape -- makes opencode refuse to serve
+    # its own free models to the agent, so it must never be reintroduced. A deny
+    # on one action, or on one command pattern, is served normally.
+    awk '
+        function q(s) { g = s; gsub(/^["\x27]|["\x27]$/, "", g); return g }
+        /^permissions:/ { inblock = 1; next }
+        inblock && /^---[[:space:]]*$/ { exit }
+        inblock && /action:/ {
+            cur = $0; sub(/^[^:]*:[[:space:]]*/, "", cur); ca = q(cur); next
+        }
+        inblock && /resource:/ {
+            cur = $0; sub(/^[^:]*:[[:space:]]*/, "", cur); cr = q(cur); next
+        }
+        inblock && /effect:/ {
+            cur = $0; sub(/^[^:]*:[[:space:]]*/, "", cur)
+            if (ca == "*" && cr == "*") ce = q(cur)
+        }
+        END { exit(ce == "deny" ? 0 : 1) }
     ' "$1" 2>/dev/null
 }
 
