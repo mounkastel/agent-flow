@@ -2935,6 +2935,48 @@ if should_run "pr/no-flags"; then
     assert_eq "gh was never called" "" "$(pr_log)"
 fi
 
+if should_run "pr/modifiers"; then
+    t "the --pr modifiers work on their own"
+    # A modifier that only means something together with --pr, but silently does
+    # nothing without it, is worse than one that implies it.
+    repo="$(make_repo pr-modifiers)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-modifiers.log" GH_PR_BODY="$SANDBOX/gh-modifiers.md"
+    : > "$GH_PR_LOG"
+
+    flow "$repo" --draft --yes "задача"
+    assert_eq "--draft alone publishes" 0 "$RUN_RC"
+    assert_contains "and opens a draft" "$(pr_log)" "pr create"
+    assert_contains "as a draft" "$(pr_log)" "--draft"
+
+    repo2="$(make_repo pr-modifiers2)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo2"
+    export GH_PR_LOG="$SANDBOX/gh-modifiers2.log" GH_PR_BODY="$SANDBOX/gh-modifiers2.md"
+    : > "$GH_PR_LOG"
+
+    flow "$repo2" --pr-base main --yes "задача"
+    assert_eq "--pr-base alone publishes" 0 "$RUN_RC"
+    assert_contains "and targets the given branch" "$(pr_log)" "pr create --base main"
+fi
+
+if should_run "pr/wrong-mode"; then
+    t "--pr on a mode that produces no work says so instead of failing obscurely"
+    repo="$(make_repo pr-wrongmode)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-wrongmode.log" GH_PR_BODY="$SANDBOX/gh-wrongmode.md"
+    : > "$GH_PR_LOG"
+
+    flow "$repo" --pr --prompt-only "подготовить"
+
+    assert_contains "it explains there is nothing to publish" "$RUN_OUT" "nothing to publish"
+    assert_eq "and the run itself still succeeds" 0 "$RUN_RC"
+    assert_not_contains "nothing was committed" "$(pr_log)" "pr create"
+    assert_contains "and no branch was pushed" "$(pushed_refs "$repo")" "main"
+fi
+
 # ------------------------------------------------------------------------------
 # Summary
 # ------------------------------------------------------------------------------

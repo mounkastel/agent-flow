@@ -67,6 +67,8 @@ agent-flow --pr --pr-base dev   target dev instead of the branch the run started
 agent-flow --yes                skip the confirmation
 ```
 
+`--draft`, `--push-only` and `--pr-base` all imply `--pr`, so they work on their own.
+
 It composes with everything else, so to make it the default:
 
 ```sh

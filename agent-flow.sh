@@ -105,9 +105,9 @@ Options:
   --pr                   After the run: commit, push and open a pull request for the
                          agent branch. Never merges anything -- you review and merge.
   --push-only            With --pr: commit and push, but do not open a pull request
-  --draft                With --pr: open the pull request as a draft
-  --pr-base BRANCH       With --pr: target this branch instead of the one the run
-                         branched from (default: that branch, else main/master)
+  --draft                Open the pull request as a draft (implies --pr)
+  --pr-base BRANCH       Target this branch instead of the one the run branched
+                         from (default: that branch, else main/master)
   --yes, -y              Skip the confirmation before discarding work or publishing
   --force                With --setup: overwrite existing agent definitions
   -h, --help             Show this help
@@ -248,9 +248,10 @@ while [ $# -gt 0 ]; do
         --yes|-y)          ASSUME_YES=1 ;;
         --pr)              PUSH_PR=1 ;;
         --push-only)       PUSH_PR=1 PUSH_ONLY=1 ;;
-        --draft)           PR_DRAFT=1 ;;
+        --draft)           PUSH_PR=1 PR_DRAFT=1 ;;
         --pr-base)
             need_value "$1" "$#"
+            PUSH_PR=1
             PR_BASE="$2"; shift ;;
         --)
             shift
@@ -5081,33 +5082,40 @@ fi
 # Publishing is the runner's job, never the agent's: the coding agent cannot
 # commit or push, so `git add -A` cannot sweep up an unrelated untracked build
 # artifact, and the branch that gets pushed is exactly the one this run made.
-run_result_word="UNKNOWN"
-if [ -s "$LATEST_REPORT" ]; then
-    run_result_word="$(report_result)"
-    case "$run_result_word" in
-        "$RESULT_COMPLETED"|"$RESULT_PARTIAL"|"$RESULT_BLOCKED"|"$RESULT_FAILED") ;;
-        *) run_result_word="UNKNOWN" ;;
-    esac
-fi
+# Only the modes that actually put an agent to work have anything to publish.
 if [ "$PUSH_PR" -eq 1 ]; then
-    if [ "$run_result_word" != "$RESULT_COMPLETED" ] && [ "$PR_DRAFT" -ne 1 ]; then
-        PR_DRAFT=1
-        warn "The run did not report COMPLETED, so the pull request is opened as a draft."
+    # Only the modes that actually put an agent to work have anything to
+    # publish; on --prompt-only there is no branch and nothing was written.
+    if [ "$MODE" != "run" ] && [ "$MODE" != "implement-only" ]; then
+        warn "--pr: nothing to publish in this mode (only a full run or --implement-only produces work)."
+    else
+        run_result_word="UNKNOWN"
+        if [ -s "$LATEST_REPORT" ]; then
+            run_result_word="$(report_result)"
+            case "$run_result_word" in
+                "$RESULT_COMPLETED"|"$RESULT_PARTIAL"|"$RESULT_BLOCKED"|"$RESULT_FAILED") ;;
+                *) run_result_word="UNKNOWN" ;;
+            esac
+        fi
+        if [ "$run_result_word" != "$RESULT_COMPLETED" ] && [ "$PR_DRAFT" -ne 1 ]; then
+            PR_DRAFT=1
+            warn "The run did not report COMPLETED, so the pull request is opened as a draft."
+        fi
+        publish_run "$run_result_word" || true
+        # Once a pull request exists, "git switch main && git merge ..." is noise:
+        # the merge happens on the forge, not here.
+        [ -n "$PR_URL" ] && MERGE_HINT=""
+        # --push-only asked for no pull request, so having none is the outcome,
+        # not a failure. Otherwise the run may well have succeeded while the
+        # publish that was requested did not happen; reporting success would
+        # hide that from a script.
+        if [ -z "$PR_URL" ] && [ "$PUSH_ONLY" -ne 1 ]; then
+            EXIT_CODE=1
+        fi
+        # The record was written before the publish, so refresh it to carry the
+        # PR and the exit code the publish decided.
+        write_run_record
     fi
-    publish_run "$run_result_word" || true
-    # Once a pull request exists, "git switch main && git merge ..." is noise:
-    # the merge happens on the forge, not here.
-    [ -n "$PR_URL" ] && MERGE_HINT=""
-    # --push-only asked for no pull request, so having none is the outcome, not
-    # a failure. Otherwise the run may well have succeeded while the publish
-    # that was requested did not happen; reporting success would hide that
-    # from a script.
-    if [ -z "$PR_URL" ] && [ "$PUSH_ONLY" -ne 1 ]; then
-        EXIT_CODE=1
-    fi
-    # The record was written before the publish, so refresh it to carry the PR
-    # and the exit code the publish decided.
-    [ -n "$PR_URL" ] || [ "$PUSH_PR" -eq 1 ] && write_run_record
 fi
 
 printf '\n' >&2
