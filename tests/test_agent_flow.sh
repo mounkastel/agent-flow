@@ -3086,6 +3086,48 @@ if should_run "publish-only/no-agent"; then
     unset MOCK_LOG
 fi
 
+if should_run "ux/run-order"; then
+    t "runs from the same second are ordered newest first"
+    repo="$(make_repo ux-runorder)"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=completed
+    flow "$repo" --prompt-only "чтобы было место" >/dev/null 2>&1
+    rm -rf "$repo/.agent/runs" "$repo/.agent/prompts/history" "$repo/.agent/reports/history"
+
+    # Two runs can start in the same second, and the second gets a -N suffix.
+    # Written out by hand here so the case is deterministic: a glob cannot
+    # order these, because '-' sorts below '.', so "…-2.meta" lands before
+    # "….meta" and the older run is reported as the newer one.
+    stamp=20260101-120000
+    for suffix in "" "-2" "-3"; do
+        n=1
+        case "$suffix" in
+            "") n=1 ;;
+            *) n="${suffix#-}" ;;
+        esac
+        mkdir -p "$repo/.agent/runs"
+        printf 'ts=%s\nid=%s%s\nmode=run\nresult=done\nrc=0\nstarted=x\n' \
+            "$stamp" "$stamp" "$suffix" > "$repo/.agent/runs/${stamp}${suffix}.meta"
+        printf 'прогон %s\n' "$n" > "$repo/.agent/runs/${stamp}${suffix}.task"
+    done
+
+    flow "$repo" --show
+    assert_eq "--show succeeds" 0 "$RUN_RC"
+    assert_contains "run 1 is the newest" "$RUN_OUT" "прогон 3"
+    assert_not_contains "not the middle one" "$RUN_OUT" "прогон 2"
+
+    flow "$repo" --show 2
+    assert_contains "run 2 counts back one" "$RUN_OUT" "прогон 2"
+
+    flow "$repo" --show 3
+    assert_contains "run 3 is the oldest" "$RUN_OUT" "прогон 1"
+
+    flow "$repo" --history
+    assert_contains "history is newest first" "$RUN_OUT" "прогон 3"
+    # The order, not just the presence: the middle run must not lead.
+    first="$(printf '%s\n' "$RUN_OUT" | grep -oE 'прогон [0-9]' | head -1)"
+    assert_eq "and nothing older comes first" "прогон 3" "$first"
+fi
+
 # ------------------------------------------------------------------------------
 # Summary
 # ------------------------------------------------------------------------------
