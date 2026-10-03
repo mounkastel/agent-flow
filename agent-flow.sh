@@ -3193,14 +3193,31 @@ record_run_end() {
     write_run_record
 }
 
-latest_run_meta() { # latest_run_meta -> path on stdout, "" if no run yet
-    local f
+run_ids_chronological() { # run ids oldest first; a collision suffix orders within a second
+    local f id stamp n
     for f in "$RUNS_DIR"/*.meta; do
         [ -f "$f" ] || continue
-        printf '%s' "$f"
-        return 0
-    done
-    return 0
+        id="${f##*/}"
+        id="${id%.meta}"
+        # Two runs can start in the same second. The second one then gets a -N
+        # suffix, and the timestamp itself contains a dash, so the suffix is
+        # whatever follows the last one. A plain glob cannot order these:
+        # "…-2.meta" sorts *before* "….meta" because '-' is lower than '.',
+        # which puts the older run first once there are three or more.
+        stamp="$id"
+        n=0
+        case "$id" in
+            *-[0-9]*) stamp="${id%-*}"; n="$((10#${id##*-}))" ;;
+        esac
+        printf '%s %06d %s\n' "$stamp" "$n" "$id"
+    done | LC_ALL=C sort -k1,1 -k2,2n -k3,3 | cut -d' ' -f3
+}
+
+latest_run_meta() { # latest_run_meta -> path of the newest run, "" if no run yet
+    local id
+    id="$(run_ids_chronological | tail -n 1)"
+    [ -n "$id" ] || return 0
+    printf '%s' "$RUNS_DIR/${id}.meta"
 }
 
 # --- status -----------------------------------------------------------------
@@ -3436,27 +3453,24 @@ list_dirty_paths() {
 }
 
 do_history() {
-    local f id result rc branch task
+    local id result rc branch task
     printf '\n%sagent-flow history%s  (newest first)\n\n' "$C_BOLD" "$C_OFF"
     if [ ! -d "$RUNS_DIR" ] || [ -z "$(latest_run_meta)" ]; then
         printf '  No runs recorded yet.\n\n'
         return 0
     fi
     printf '  %-16s %-9s %-28s %s\n' "WHEN" "RESULT" "BRANCH" "TASK"
-    for f in "$RUNS_DIR"/*.meta; do
-        [ -f "$f" ] || continue
-        id="$(read_meta_value id "$f")"
-        [ -n "$id" ] || id="${f##*/}"
-        id="${id%.meta}"
-        result="$(read_meta_value result "$f")"
-        rc="$(read_meta_value rc "$f")"
-        branch="$(read_meta_value branch "$f")"
+    for id in $(run_ids_chronological | awk '{ a[NR] = $0 } END { for (i = NR; i >= 1; i--) print a[i] }'); do
+        result="$(read_meta_value result "$RUNS_DIR/${id}.meta")"
+        rc="$(read_meta_value rc "$RUNS_DIR/${id}.meta")"
+        branch="$(read_meta_value branch "$RUNS_DIR/${id}.meta")"
         task="$(one_line "$(cat "$RUNS_DIR/${id}.task" 2>/dev/null || true)" 40)"
         case "$result" in
             done) result="done" ;;
             *)    result="${result:-?}${rc:+/$rc}" ;;
         esac
-        printf '  %-16s %-9s %-28s %s\n' "$(read_meta_value ts "$f")" "$result" "${branch:0:28}" "${task:--}"
+        printf '  %-16s %-9s %-28s %s\n' \
+            "$(read_meta_value ts "$RUNS_DIR/${id}.meta")" "$result" "${branch:0:28}" "${task:--}"
     done
     printf '\n  Show one with:  %s --show N      (N counts back from the newest)\n\n' "$SELF_NAME"
     return 0
@@ -3464,19 +3478,10 @@ do_history() {
 
 # --- show -------------------------------------------------------------------
 
-resolve_run_id() { # resolve_run_id N -> run id on stdout
-    local want="${1:-1}" f id i=0
-    for f in "$RUNS_DIR"/*.meta; do
-        [ -f "$f" ] || continue
-        i=$((i + 1))
-        id="${f##*/}"
-        id="${id%.meta}"
-        if [ "$i" -eq "$want" ]; then
-            printf '%s' "$id"
-            return 0
-        fi
-    done
-    return 0
+resolve_run_id() { # resolve_run_id N -> run id on stdout, "" if there is no such run
+    # --show 1 is the newest run, so count from the end of the chronological list.
+    run_ids_chronological \
+        | awk -v n="${1:-1}" '{ a[NR] = $0 } END { if (n >= 1 && n <= NR) print a[NR - n + 1] }'
 }
 
 do_show() {
