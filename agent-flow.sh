@@ -3636,25 +3636,45 @@ ensure_dirs() {
 }
 
 resolve_pr_base() { # resolve_pr_base -> the branch the PR should target
-    local candidate upstream
+    local candidate upstream current
+    current="$(current_branch_name)"
     [ -n "$PR_BASE" ] && { printf '%s' "$PR_BASE"; return 0; }
     # BASE_BRANCH is what this run actually branched from, which is the right
-    # answer even when the repository's default is not main/master.
-    if [ -n "$RUN_BASE" ] && [ "$RUN_BASE" != "detached HEAD" ]; then
+    # answer even when the repository's default is not main/master. It is unset
+    # when the run reused an existing agent branch, which is the next case.
+    if [ -n "$RUN_BASE" ] && [ "$RUN_BASE" != "detached HEAD" ] \
+        && [ "$RUN_BASE" != "$current" ]; then
         printf '%s' "$RUN_BASE"
         return 0
     fi
+    # A reused agent branch tracks origin/<same branch>, so the upstream is the
+    # branch itself and useless as a base. Skip it and fall through.
     upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
     case "$upstream" in
-        origin/*) printf '%s' "${upstream#origin/}"; return 0 ;;
+        origin/*)
+            candidate="${upstream#origin/}"
+            if [ "$candidate" != "$current" ]; then
+                printf '%s' "$candidate"
+                return 0
+            fi
+            ;;
     esac
     for candidate in main master trunk develop; do
+        [ "$candidate" = "$current" ] && continue
         if git show-ref --verify --quiet "refs/heads/$candidate" \
             || git show-ref --verify --quiet "refs/remotes/origin/$candidate"; then
             printf '%s' "$candidate"
             return 0
         fi
     done
+    # Last resort: whatever branches exist that are not the current one.
+    candidate="$(git for-each-ref --format='%(refname:short)' refs/heads refs/remotes/origin \
+        2>/dev/null | grep -v '^origin/HEAD$' | grep -v "/${current}\$" \
+        | sed 's|^origin/||' | grep -v '/' | grep . | head -n 1 || true)"
+    if [ -n "$candidate" ]; then
+        printf '%s' "$candidate"
+        return 0
+    fi
     printf 'main'
 }
 
