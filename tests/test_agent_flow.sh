@@ -2665,6 +2665,8 @@ if should_run "pr/basic"; then
     assert_contains "the PR body carries the run result" "$(cat "$GH_PR_BODY")" "Result:"
     assert_contains "the run record carries the PR" \
         "$(grep -rh pull_request "$repo/.agent/runs" 2>/dev/null || true)" "pull/42"
+    assert_eq "and the run was recorded once, not twice" "1" \
+        "$(find "$repo/.agent/runs" -name '*.meta' -type f 2>/dev/null | wc -l | tr -d ' ')"
 fi
 
 if should_run "pr/never-merge"; then

@@ -3134,9 +3134,13 @@ current_branch_name() {
 }
 
 write_run_record() {
-    local branch
+    local branch started
     [ -n "$RUN_META" ] || return 0
     branch="$(current_branch_name)"
+    # The record is written again after publishing so it can carry the pull
+    # request. A run's start time must not move because of that.
+    started="$(read_meta_value started "$RUN_META")"
+    [ -n "$started" ] || started="$(date '+%Y-%m-%d %H:%M:%S')"
     {
         printf 'ts=%s\n' "$TS"
         printf 'id=%s\n' "$RUN_ID"
@@ -3148,7 +3152,7 @@ write_run_record() {
         printf 'result=%s\n' "$RUN_RESULT"
         printf 'rc=%s\n' "$EXIT_CODE"
         printf 'pull_request=%s\n' "$PR_URL"
-        printf 'started=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf 'started=%s\n' "$started"
     } > "$RUN_META" 2>/dev/null || true
     return 0
 }
