@@ -69,6 +69,16 @@ agent-flow --yes                skip the confirmation
 
 `--draft`, `--push-only` and `--pr-base` all imply `--pr`, so they work on their own.
 
+**Already ran it without `--pr`?** `--publish-only` publishes the tree as it stands and
+starts no agent, so a finished run never has to be repeated just to send it:
+
+```sh
+agent-flow --publish-only
+```
+
+It still refuses to merge, and it reads the last report to decide between a normal pull
+request and a draft, exactly as `--pr` does after a run.
+
 It composes with everything else, so to make it the default:
 
 ```sh

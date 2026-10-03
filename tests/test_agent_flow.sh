@@ -2977,6 +2977,115 @@ if should_run "pr/wrong-mode"; then
     assert_contains "and no branch was pushed" "$(pushed_refs "$repo")" "main"
 fi
 
+if should_run "publish-only"; then
+    t "--publish-only sends finished work without running an agent again"
+    repo="$(make_repo publishonly)"
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-publishonly.log" GH_PR_BODY="$SANDBOX/gh-publishonly.md"
+    : > "$GH_PR_LOG"
+    mock_log publishonly
+
+    # Stand in for a run that already happened: an agent branch and the tree it
+    # left behind, plus the report it wrote.
+    branch="agent/night-light-20261003-0904"
+    git -C "$repo" checkout -q -b "$branch"
+    printf '#!/usr/bin/env bash\necho on\n' > "$repo/night-light.sh"
+    chmod +x "$repo/night-light.sh"
+    mkdir -p "$repo/.agent/reports"
+    printf '# Result\n\nCOMPLETED\n\n# Summary\n\nNight light toggle added.\n' \
+        > "$repo/.agent/reports/latest.md"
+
+    RUN_OUT="$(cd "$repo" && bash "$SCRIPT" --publish-only --yes 2>&1)"
+    RUN_RC=$?
+
+    assert_eq "it succeeds" 0 "$RUN_RC"
+    assert_eq "no agent was started" "" "$(cat "$MOCK_LOG" 2>/dev/null || true)"
+    assert_contains "the work was committed" "$RUN_OUT" "Committed to agent/"
+    assert_contains "and pushed" "$(pushed_refs "$repo")" "$branch"
+    assert_contains "and a PR was opened" "$(pr_log)" "pr create --base main"
+    assert_not_contains "as a normal PR, since the report said COMPLETED" \
+        "$(pr_log)" "--draft"
+    assert_contains "with the summary as the title" "$(pr_log)" "Night light toggle added"
+    assert_not_contains "no bookkeeping rode along" \
+        "$(git -C "$repo" show --name-only --format= "$branch")" ".agent/"
+    assert_contains "but the script did" \
+        "$(git -C "$repo" show --name-only --format= "$branch")" "night-light.sh"
+    unset MOCK_LOG
+fi
+
+if should_run "publish-only/draft"; then
+    t "--publish-only opens a draft when the last run was not COMPLETED"
+    repo="$(make_repo publishonly-draft)"
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-publishonly-draft.log" GH_PR_BODY="$SANDBOX/gh-publishonly-draft.md"
+    : > "$GH_PR_LOG"
+
+    branch="agent/half-done-20261003-1000"
+    git -C "$repo" checkout -q -b "$branch"
+    printf 'half\n' > "$repo/partial.txt"
+    mkdir -p "$repo/.agent/reports"
+    printf '# Result\n\nBLOCKED\n' > "$repo/.agent/reports/latest.md"
+
+    RUN_OUT="$(cd "$repo" && bash "$SCRIPT" --publish-only --yes 2>&1)"
+    RUN_RC=$?
+
+    assert_eq "it succeeds" 0 "$RUN_RC"
+    assert_contains "the PR was opened" "$(pr_log)" "pr create"
+    assert_contains "as a draft" "$(pr_log)" "--draft"
+    assert_contains "with the result in the title" "$(pr_log)" "[BLOCKED]"
+    assert_contains "and it says why" "$RUN_OUT" "did not report COMPLETED"
+fi
+
+if should_run "publish-only/refuse"; then
+    t "--publish-only keeps the rules --pr has"
+    repo="$(make_repo publishonly-refuse)"
+    with_origin "$repo"
+    export GH_PR_LOG="$SANDBOX/gh-publishonly-refuse.log" GH_PR_BODY="$SANDBOX/gh-publishonly-refuse.md"
+    : > "$GH_PR_LOG"
+
+    # Not an agent branch.
+    flow "$repo" --publish-only --yes "ничего не публикуем"
+    assert_ne "a branch it did not create is refused" 0 "$RUN_RC"
+    assert_contains "and it says why" "$RUN_OUT" "not on an agent branch"
+    assert_not_contains "nothing was published" "$(pr_log)" "pr create"
+
+    # Credentials.
+    branch="agent/with-secret-20261003-1100"
+    git -C "$repo" checkout -q -b "$branch"
+    printf 'TOKEN=nope\n' > "$repo/.env"
+    RUN_OUT="$(cd "$repo" && bash "$SCRIPT" --publish-only --yes 2>&1)"
+    RUN_RC=$?
+    assert_ne "credentials are refused" 0 "$RUN_RC"
+    assert_contains "and named" "$RUN_OUT" "look like credentials"
+    assert_not_contains "no PR was opened" "$(pr_log)" "pr create"
+
+    # Clean tree.
+    git -C "$repo" reset -q
+    rm -f "$repo/.env"
+    RUN_OUT="$(cd "$repo" && bash "$SCRIPT" --publish-only --yes 2>&1)"
+    RUN_RC=$?
+    assert_ne "nothing to publish is said out loud" 0 "$RUN_RC"
+    assert_contains "and it explains why" "$RUN_OUT" "Nothing changed"
+fi
+
+if should_run "publish-only/no-agent"; then
+    t "--publish-only starts nothing, even with a task in hand"
+    repo="$(make_repo publishonly-quiet)"
+    with_origin "$repo"
+    export MOCK_CB=good MOCK_PE=good MOCK_CA=modify
+    export GH_PR_LOG="$SANDBOX/gh-publishonly-quiet.log" GH_PR_BODY="$SANDBOX/gh-publishonly-quiet.md"
+    : > "$GH_PR_LOG"
+    branch="agent/quiet-20261003-1200"
+    git -C "$repo" checkout -q -b "$branch"
+    printf 'x\n' > "$repo/file.txt"
+    mock_log quiet
+
+    flow "$repo" --publish-only --yes "этот текст должен быть проигнорирован"
+    assert_eq "it publishes" 0 "$RUN_RC"
+    assert_eq "without starting a single agent" "" "$(cat "$MOCK_LOG" 2>/dev/null || true)"
+    unset MOCK_LOG
+fi
+
 # ------------------------------------------------------------------------------
 # Summary
 # ------------------------------------------------------------------------------
