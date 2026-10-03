@@ -85,6 +85,8 @@ Usage:
   agent-flow.sh --history                      List past runs, newest first
   agent-flow.sh --show [N]                     Show run N (default 1 = the newest)
   agent-flow.sh --undo                         Remove the agent branch and its uncommitted work
+  agent-flow.sh --pr "Task"                    Run, then commit, push and open a pull request
+  agent-flow.sh --pr --draft "Task"            Same, but as a draft pull request
   echo "task" | agent-flow.sh                  Read the task from stdin
 
 Options:
@@ -100,7 +102,13 @@ Options:
   --context-model MODEL  Model for Context Builder (defaults to the PE model)
   --models               Interactively pick the models and save them for this repo
   --undo                 Return to the base branch and delete the agent branch
-  --yes, -y              With --undo: skip the confirmation before discarding work
+  --pr                   After the run: commit, push and open a pull request for the
+                         agent branch. Never merges anything -- you review and merge.
+  --push-only            With --pr: commit and push, but do not open a pull request
+  --draft                With --pr: open the pull request as a draft
+  --pr-base BRANCH       With --pr: target this branch instead of the one the run
+                         branched from (default: that branch, else main/master)
+  --yes, -y              Skip the confirmation before discarding work or publishing
   --force                With --setup: overwrite existing agent definitions
   -h, --help             Show this help
 
@@ -178,6 +186,11 @@ CONTEXT_MODEL_FLAGGED=0
 CHOOSE_MODELS=0
 SHOW_RUN="1"
 ASSUME_YES=0
+PUSH_PR=0
+PUSH_ONLY=0
+PR_DRAFT=0
+PR_BASE=""
+PR_URL=""
 OPENCODE_BIN="${AGENT_FLOW_OPENCODE_BIN:-opencode}"
 OPENCODE_EXTRA_ARGS="${AGENT_FLOW_OPENCODE_ARGS:-}"
 OPENCODE_HAS_AUTO=""
@@ -233,6 +246,12 @@ while [ $# -gt 0 ]; do
             esac ;;
         --undo)            MODE="undo" ;;
         --yes|-y)          ASSUME_YES=1 ;;
+        --pr)              PUSH_PR=1 ;;
+        --push-only)       PUSH_PR=1 PUSH_ONLY=1 ;;
+        --draft)           PR_DRAFT=1 ;;
+        --pr-base)
+            need_value "$1" "$#"
+            PR_BASE="$2"; shift ;;
         --)
             shift
             TASK="${TASK:+$TASK }$*"
@@ -3120,6 +3139,7 @@ write_run_record() {
         printf 'created_branch=%s\n' "$BRANCH_CREATED"
         printf 'result=%s\n' "$RUN_RESULT"
         printf 'rc=%s\n' "$EXIT_CODE"
+        printf 'pull_request=%s\n' "$PR_URL"
         printf 'started=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
     } > "$RUN_META" 2>/dev/null || true
     return 0
@@ -3458,6 +3478,9 @@ do_show() {
         "$C_BOLD" "$(read_meta_value ts "$meta")" "$C_OFF" \
         "$(read_meta_value mode "$meta")" "${result:-?}" "${rc:-?}"
     printf '  branch: %s\n' "${branch:-n/a}"
+    if [ -n "$(read_meta_value pull_request "$meta")" ]; then
+        printf '  pull request: %s\n' "$(read_meta_value pull_request "$meta")"
+    fi
     if [ -s "$RUNS_DIR/${id}.task" ]; then
         printf '\n%sTask%s\n' "$C_BOLD" "$C_OFF"
         sed 's/^/  /' "$RUNS_DIR/${id}.task"
@@ -3588,6 +3611,200 @@ ensure_dirs() {
     mkdir -p "$AGENT_DIR" "$PROMPT_DIR/history" "$REPORT_DIR/history" \
              "$RUNS_DIR" "$LOG_DIR" "$RUNTIME_DIR" "$CONTEXT_DIR" \
         || die "Cannot create workflow directories under ${WORKFLOW_DIR#"$ROOT"/} (check permissions)."
+}
+
+resolve_pr_base() { # resolve_pr_base -> the branch the PR should target
+    local candidate upstream
+    [ -n "$PR_BASE" ] && { printf '%s' "$PR_BASE"; return 0; }
+    # BASE_BRANCH is what this run actually branched from, which is the right
+    # answer even when the repository's default is not main/master.
+    if [ -n "$RUN_BASE" ] && [ "$RUN_BASE" != "detached HEAD" ]; then
+        printf '%s' "$RUN_BASE"
+        return 0
+    fi
+    upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+    case "$upstream" in
+        origin/*) printf '%s' "${upstream#origin/}"; return 0 ;;
+    esac
+    for candidate in main master trunk develop; do
+        if git show-ref --verify --quiet "refs/heads/$candidate" \
+            || git show-ref --verify --quiet "refs/remotes/origin/$candidate"; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    printf 'main'
+}
+
+report_line() { # report_line HEADING -> first non-empty line under that heading
+    [ -s "$LATEST_REPORT" ] || return 0
+    awk -v h="$1" '
+        function q(s) { gsub(/^#+[[:space:]]+/, "", s); gsub(/[[:space:]]+$/, "", s); return s }
+        /^#+[[:space:]]+/ {
+            cur = q($0)
+            if (f && cur != "") { print cur; exit }
+            low = tolower(cur); f = (low == tolower(h)); next
+        }
+        f && NF { line = $0; gsub(/^[*_`[:space:]]+/, "", line); gsub(/[[:space:]]+$/, "", line)
+                  if (line != "") { print line; exit } }
+    ' "$LATEST_REPORT" 2>/dev/null || true
+}
+
+publish_run() { # publish_run RESULT_WORD -> sets PR_URL
+    local branch base title summary staged secret n url existing body_file
+
+    [ "$PUSH_PR" -eq 1 ] || return 0
+    PR_URL=""
+    if [ "$IN_GIT" -ne 1 ]; then
+        warn "--pr: not a git repository, nothing to publish."
+        return 1
+    fi
+    branch="$(current_branch_name)"
+    case "$branch" in
+        agent/*) ;;
+        *)
+            warn "--pr: you are on '$branch', not on an agent branch."
+            printf '  --pr publishes the branch agent-flow created. Start a run that makes\n'
+            printf '  one, or use --branch NAME. Nothing was changed.\n'
+            return 1
+            ;;
+    esac
+    if ! git remote get-url origin >/dev/null 2>&1; then
+        warn "--pr: this repository has no 'origin' remote. Nothing was pushed."
+        return 1
+    fi
+    if ! command -v gh >/dev/null 2>&1; then
+        warn "--pr: the GitHub CLI (gh) is not installed, so no pull request can be opened."
+        printf '  The commit and push still happen. Open the PR by hand:\n'
+        printf '      gh pr create --base %s --head %s\n\n' "$(resolve_pr_base)" "$branch"
+        return 1
+    fi
+    if ! gh auth status >/dev/null 2>&1; then
+        warn "--pr: gh is installed but not authenticated (gh auth status)."
+        printf '  The commit and push still happen. Then run: gh auth login\n'
+        printf '  and open the PR by hand:\n'
+        printf '      gh pr create --base %s --head %s\n\n' "$(resolve_pr_base)" "$branch"
+        return 1
+    fi
+
+    base="$(resolve_pr_base)"
+    if [ "$base" = "$branch" ]; then
+        warn "--pr: the PR base is the branch itself ($branch). Nothing to publish."
+        return 1
+    fi
+
+    git add -A || { error "Could not stage changes; nothing was committed."; return 1; }
+    if git diff --cached --quiet; then
+        printf '\n'
+        warn "Nothing changed, so there is nothing to open a pull request for."
+        git reset -q
+        return 1
+    fi
+
+    # A commit is permanent and gets pushed. Anything that looks like a
+    # credential stops here rather than travelling to a remote.
+    staged="$(git diff --cached --name-only)"
+    secret="$(printf '%s\n' "$staged" | grep -E '(^|/)(\.env($|\.)|\.netrc$|\.npmrc$|\.pypirc$|credentials$|id_rsa|id_ed25519|.*\.(pem|key|p12|pfx|ppk|asc|gpg|kdbx)$)' || true)"
+    if [ -n "$secret" ]; then
+        printf '\n'
+        error "Refusing to commit: these look like credentials."
+        printf '%s\n' "$secret" | sed 's/^/    /' >&2
+        printf '\n'
+        printf '  They are staged but NOT committed and NOT pushed.\n'
+        printf '  Move them out of the repository or add them to .gitignore, then re-run.\n'
+        printf '  To drop them from the commit for now: git reset\n'
+        return 1
+    fi
+    if printf '%s\n' "$staged" | grep -qE '^\.agent/|^\.opencode/agents/'; then
+        error "Workflow bookkeeping would be committed. Run --setup first; nothing was committed."
+        git reset -q
+        return 1
+    fi
+
+    n="$(printf '%s\n' "$staged" | grep -c . || true)"
+    printf '\n'
+    info "About to commit $n path(s) to $branch:"
+    printf '%s\n' "$staged" | sed 's/^/    /' >&2
+    if [ "$ASSUME_YES" -ne 1 ]; then
+        printf '\n  Commit, push and open a PR against %s? Type "pr" to confirm: ' "$base" >&2
+        if ! ask "" ""; then
+            printf '\n'
+            warn "Nothing was committed or pushed."
+            git reset -q
+            return 1
+        fi
+        case "$PROMPT_REPLY" in
+            pr) ;;
+            *) printf '\n'; warn "Nothing was committed or pushed."; git reset -q; return 1 ;;
+        esac
+    fi
+
+    summary="$(report_line "Summary")"
+    [ -n "$summary" ] || summary="$(report_line "Task")"
+    [ -n "$summary" ] || summary="${TASK:-agent-flow run}"
+    title="$(one_line "$summary" 70)"
+    case "$1" in
+        "$RESULT_COMPLETED") ;;
+        *) title="[$1] $title" ;;
+    esac
+
+    body_file="$RUNTIME_DIR/pr-body.$$"
+    mkdir -p "$RUNTIME_DIR" 2>/dev/null || true
+    {
+        # Markdown backticks are literal here, not command substitution.
+        # shellcheck disable=SC2016
+        printf 'Opened automatically by `%s --pr`.\n\n' "$SELF_NAME"
+        # shellcheck disable=SC2016
+        printf '**Result:** `%s`\n\n' "$1"
+        printf -- '---\n\n'
+        cat "$LATEST_REPORT" 2>/dev/null || printf '(no report)\n'
+    } > "$body_file" 2>/dev/null || printf '(no report)\n' > "$body_file"
+
+    if ! git commit -q -m "$title" -m "Result: $1
+
+Branch: $branch
+Base:   $base"; then
+        rm -f "$body_file" 2>/dev/null || true
+        error "git commit failed; nothing was pushed."
+        return 1
+    fi
+    success "Committed to $branch."
+
+    if ! git push -q --set-upstream origin "$branch" 2>"$RUNTIME_DIR/push-err.$$"; then
+        rm -f "$body_file" 2>/dev/null || true
+        error "git push failed. The commit is local and safe; nothing was lost."
+        sed 's/^/    /' "$RUNTIME_DIR/push-err.$$" >&2 2>/dev/null || true
+        rm -f "$RUNTIME_DIR/push-err.$$" 2>/dev/null || true
+        return 1
+    fi
+    rm -f "$RUNTIME_DIR/push-err.$$" 2>/dev/null || true
+    success "Pushed to origin/$branch."
+
+    existing="$(gh pr list --head "$branch" --state open --json number -q '.[].number' 2>/dev/null | head -n 1 || true)"
+    if [ "$PUSH_ONLY" -eq 1 ]; then
+        url=""
+        if [ -n "$existing" ]; then
+            gh pr edit "$existing" --title "$title" --body-file "$body_file" >/dev/null 2>&1 || true
+            url="$(gh pr view "$existing" --json url -q .url 2>/dev/null || true)"
+        fi
+    elif [ -n "$existing" ]; then
+        gh pr edit "$existing" --title "$title" --body-file "$body_file" >/dev/null 2>&1 || true
+        url="$(gh pr view "$existing" --json url -q .url 2>/dev/null || true)"
+    else
+        set -- pr create --base "$base" --head "$branch" --title "$title" --body-file "$body_file"
+        [ "$PR_DRAFT" -eq 1 ] && set -- "$@" --draft
+        url="$(gh "$@" 2>/dev/null || true)"
+    fi
+    rm -f "$body_file" 2>/dev/null || true
+    if [ -z "$url" ] && [ "$PUSH_ONLY" -ne 1 ]; then
+        warn "The branch is pushed, but the pull request could not be opened."
+        printf '  Open it by hand:  gh pr create --base %s --head %s\n' "$base" "$branch"
+        return 1
+    fi
+    PR_URL="$url"
+    [ -n "$PR_URL" ] && success "Pull request: $PR_URL"
+    printf '  Review it, then merge. %s does not merge anything on its own.\n' "$SELF_NAME"
+    return 0
 }
 
 setup_workflow() {
@@ -4812,6 +5029,38 @@ else
     record_run_end "failed"
 fi
 
+# Publishing is the runner's job, never the agent's: the coding agent cannot
+# commit or push, so `git add -A` cannot sweep up an unrelated untracked build
+# artifact, and the branch that gets pushed is exactly the one this run made.
+run_result_word="UNKNOWN"
+if [ -s "$LATEST_REPORT" ]; then
+    run_result_word="$(report_result)"
+    case "$run_result_word" in
+        "$RESULT_COMPLETED"|"$RESULT_PARTIAL"|"$RESULT_BLOCKED"|"$RESULT_FAILED") ;;
+        *) run_result_word="UNKNOWN" ;;
+    esac
+fi
+if [ "$PUSH_PR" -eq 1 ]; then
+    if [ "$run_result_word" != "$RESULT_COMPLETED" ] && [ "$PR_DRAFT" -ne 1 ]; then
+        PR_DRAFT=1
+        warn "The run did not report COMPLETED, so the pull request is opened as a draft."
+    fi
+    publish_run "$run_result_word" || true
+    # Once a pull request exists, "git switch main && git merge ..." is noise:
+    # the merge happens on the forge, not here.
+    [ -n "$PR_URL" ] && MERGE_HINT=""
+    # --push-only asked for no pull request, so having none is the outcome, not
+    # a failure. Otherwise the run may well have succeeded while the publish
+    # that was requested did not happen; reporting success would hide that
+    # from a script.
+    if [ -z "$PR_URL" ] && [ "$PUSH_ONLY" -ne 1 ]; then
+        EXIT_CODE=1
+    fi
+    # The record was written before the publish, so refresh it to carry the PR
+    # and the exit code the publish decided.
+    [ -n "$PR_URL" ] || [ "$PUSH_PR" -eq 1 ] && write_run_record
+fi
+
 printf '\n' >&2
 if [ "$EXIT_CODE" -eq 0 ]; then
     success "Workflow finished."
@@ -4833,7 +5082,8 @@ Logs:           .agent/logs/
 
 Review the changes:   git status && git diff
 Continue:             ./agent-flow.sh --continue "What should happen next?"
-${MERGE_HINT:+Merge when happy:    $MERGE_HINT}
+${PR_URL:+Pull request:        $PR_URL}
+${MERGE_HINT:+Merge when happy: $MERGE_HINT}
 EOF
 
 exit "$EXIT_CODE"
